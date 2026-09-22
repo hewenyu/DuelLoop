@@ -1,0 +1,50 @@
+{
+  "name": "duelloop",
+  "version": "0.1.0",
+  "description": "A dual-loop SDK for adversarial decision applications",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "duelloop": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "templates",
+    "README.md",
+    "docs",
+    "!docs/evidence/**",
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:live": "npm run build && node --env-file-if-exists=.env --test test/live/*.test.mjs",
+    "demo": "npm run check:package",
+    "benchmark": "npm run build && node scripts/benchmark.mjs --fixture",
+    "benchmark:concurrency": "npm run build && node scripts/concurrency-benchmark.mjs --fixture",
+    "experiment:m0": "npm run build && node scripts/m0.mjs",
+    "check:package": "npm run build && node scripts/check-package.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@typesafe-ai/sdk": "0.6.0",
+    "@earendil-works/pi-coding-agent": "0.87.0",
+    "@earendil-works/pi-ai": "0.87.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

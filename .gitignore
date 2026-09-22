@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.duelloop/
+*.tgz
+.DS_Store
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+!.env.example
+artifacts/
+coverage/
+demo/.duelloop/
+# Local model responses, holdout records, logs and machine-specific evidence.
+docs/evidence/
+*.log
