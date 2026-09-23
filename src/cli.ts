@@ -45,10 +45,10 @@ async function writableJson(path: string, value: unknown): Promise<void> {
   catch { throw new DuelLoopError('CONFLICT', 'Cannot create output file; an existing file is never overwritten', { path }); }
 }
 function starterProtocol(domainId: string, stage: 'development' | 'final'): EvaluationProtocol {
-  return { version: '1.0', id: `${domainId}-${stage}-v1`, domainId, seeds: stage === 'development' ? [1,2,3,4] : [101,102,103,104],
+  return { version: '2.0', id: `${domainId}-${stage}-v2`, domainId, seeds: stage === 'development' ? [1,2,3,4] : [101,102,103,104],
     opponentIds: domainId === 'kuhn-poker' ? ['calling','tight'] : ['fixed','random'], trajectoriesPerSeed: 12,
     knowledgeStateMode: 'frozen', initialKnowledge: {}, metric: { name: 'reward', direction: 'maximize', unit: domainId === 'kuhn-poker' ? 'chips/hand' : 'credits/checkpoint' },
-    minSamples: 4, minimumImprovement: 0.01, maxGroupRegression: 0.1, confidenceLevel: 0.95, maxFallbackRate: 0.1,
+    minSamples: 4, minimumImprovement: 0.01, maxGroupRegression: 0.1, confidenceLevel: 0.95,
     maxP95LatencyMs: 5000, maxDevelopmentEvalRuns: 6, maxFinalEvaluationsPerRun: 1, holdoutId: `${domainId}-${stage}-${randomUUID()}`, maxHoldoutUses: 1 };
 }
 async function initialize(flags: Record<string, string>) {
@@ -77,7 +77,7 @@ async function domainFor(config: DuelLoopConfiguration): Promise<{ domain: Domai
     catch { throw new DuelLoopError('CONFIG_INVALID', 'Could not import trusted domain module', { path: config.domain.path }); }
     const factory = module[config.domain.exportName]; invariant(typeof factory === 'function', 'CONFIG_INVALID', 'Domain factory export is not a function');
     const result = await factory({ applicationId: config.applicationId, scopeId: config.scopeId, options: config.domain.options });
-    invariant(result?.domain && typeof result.domain.observe === 'function' && typeof result.domain.candidates === 'function' && typeof result.domain.fallback === 'function', 'CONFIG_INVALID', 'Domain factory must return {domain,evaluator?}');
+    invariant(result?.domain && typeof result.domain.observe === 'function' && typeof result.domain.candidates === 'function', 'CONFIG_INVALID', 'Domain factory must return {domain,evaluator?}');
     return result;
   }
   const options = { applicationId: config.applicationId, scopeId: config.scopeId, seed: config.domain.seed, opponentId: config.domain.opponentId,

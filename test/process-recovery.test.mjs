@@ -9,7 +9,7 @@ const child=(source,args=[])=>new Promise((resolve,reject)=>{
   const p=spawn(process.execPath,['--input-type=module','-e',source,...args],{stdio:['ignore','pipe','pipe']});let output='',error='';
   p.stdout.on('data',v=>output+=v);p.stderr.on('data',v=>error+=v);p.on('error',reject);p.on('exit',code=>resolve({code,output,error}));
 });
-const model=()=>new FixtureDecisionModel('process-fixture',()=>({score:1,confidence:1}));
+const model=()=>new FixtureDecisionModel('process-fixture',q=>({score:1,confidence:1,probabilities:Object.fromEntries(q.criteria.map((_,i)=>[i,Number(i===1)]))}));
 
 test('two actual worker processes cannot create concurrent research for one scope',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'duelloop-process-'));const path=join(dir,'state.sqlite');
@@ -26,7 +26,7 @@ test('two actual worker processes cannot create concurrent research for one scop
 test('crash after external acceptance preserves intent and requires reconciliation before owner takeover',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'duelloop-crash-'));const path=join(dir,'state.sqlite'),ledger=join(dir,'external-ledger.json');
   try {
-    const result=await child(`import {writeFileSync} from 'node:fs';import {SqliteStore,DuelLoop,KuhnPokerDomain,FixtureDecisionModel,createKuhnStrategy} from 'duelloop';const store=new SqliteStore(process.argv[1]);const domain=new KuhnPokerDomain({applicationId:'process',scopeId:'scope'});domain.execute=async c=>{writeFileSync(process.argv[2],JSON.stringify({decisionId:c.decisionId,idempotencyKey:c.idempotencyKey,status:'completed',timestamp:Date.now()}));process.exit(17);};const app=new DuelLoop({applicationId:'process',domain,model:new FixtureDecisionModel('process-fixture',()=>({score:1,confidence:1})),store,executionOwner:'framework'});app.bootstrap(createKuhnStrategy(),'scope');await app.step('a');`,[path,ledger]);
+    const result=await child(`import {writeFileSync} from 'node:fs';import {SqliteStore,DuelLoop,KuhnPokerDomain,FixtureDecisionModel,createKuhnStrategy} from 'duelloop';const store=new SqliteStore(process.argv[1]);const domain=new KuhnPokerDomain({applicationId:'process',scopeId:'scope'});domain.execute=async c=>{writeFileSync(process.argv[2],JSON.stringify({decisionId:c.decisionId,idempotencyKey:c.idempotencyKey,status:'completed',timestamp:Date.now()}));process.exit(17);};const app=new DuelLoop({applicationId:'process',domain,model:new FixtureDecisionModel('process-fixture',q=>({score:1,confidence:1,probabilities:Object.fromEntries(q.criteria.map((_,i)=>[i,Number(i===1)]))})),store,executionOwner:'framework'});app.bootstrap(createKuhnStrategy(),'scope');await app.step('a');`,[path,ledger]);
     assert.equal(result.code,17,result.error);
     const store=new SqliteStore(path);const intent=store.intents('scope')[0];assert.ok(intent);assert.equal(intent.receipt,null);
     assert.throws(()=>store.acquireOwner('scope','a','new-process'),{code:'EXECUTION_UNKNOWN'});

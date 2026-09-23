@@ -8,7 +8,7 @@ for (const [Domain, hidden] of [[KuhnPokerDomain, ['opponent.card', 'cards', 'de
   test(`${Domain.name} satisfies sandbox domain conformance`, async () => {
     const report = await runDomainConformance(() => new Domain({ seed: 42 }), { forbiddenFeaturePaths: hidden });
     assert.equal(report.passed, true, JSON.stringify(report.checks));
-    assert(report.checks.some(c => c.status === 'skipped' && c.name === 'forced-action'));
+    assert(report.checks.some(c => c.status === 'skipped' && c.name === 'single-candidate'));
   });
 }
 test('Kuhn implements all terminal histories, legal actions, chip payoffs and alternating private seats', async () => {
@@ -51,7 +51,7 @@ test('Auction settles delayed feedback by revision and activates only after conf
   const first = await domain.feedback(); assert.equal(first[0].settled, false); assert.equal(first[0].revision, 1);
   const final = await domain.feedback(); assert.equal(final[0].feedbackId, first[0].feedbackId); assert.equal(final[0].revision, 2);
   assert.equal(final[0].metrics.reward, a.features['self.value'] - 2);
-  await domain.execute(cmd(b, await domain.fallback(b, 'test'), 'b')); assert.equal(await domain.canActivate('default'), true);
+  await domain.execute(cmd(b, (await domain.candidates(b))[0], 'b')); assert.equal(await domain.canActivate('default'), true);
 });
 test('Cross application and actor observations are rejected', async () => {
   const domain = new KuhnPokerDomain({ applicationId: 'a' }); const observation = await domain.observe('s');
@@ -66,7 +66,7 @@ for (const [Adapter, strategy, opponent] of [[KuhnEvaluationAdapter, createKuhnS
     const adapter = new Adapter(); const knowledge = { 'opponent.calls': 1, 'opponent.callOpportunities': 3 };
     const input = { strategy: strategy(), model, seed: 100, opponentId: opponent, trajectories: 20, knowledge, knowledgeStateMode: 'online_update', signal: new AbortController().signal };
     const a = await adapter.episode(input); const b = await adapter.episode(input);
-    assert.equal(a.reward, b.reward); assert.equal(a.decisions, b.decisions); assert.equal(a.fallbacks, 0);
+    assert.equal(a.reward, b.reward); assert.equal(a.decisions, b.decisions);
     assert.equal(a.modelCalls, a.decisions); assert(a.modelCalls >= 20); assert.deepEqual(knowledge, input.knowledge);
     const cancelled = new AbortController(); cancelled.abort(); await assert.rejects(adapter.episode({ ...input, signal: cancelled.signal }), { code: 'CANCELLED' });
   });
@@ -82,11 +82,40 @@ test('Frozen knowledge remains fixed while online knowledge incorporates observe
     assert.equal(next.features['opponent.observedCallRate'], mode === 'frozen' ? 0.5 : 1);
   }
 });
-test('Evaluation includes low confidence fallback in measured decisions and rejects empty experiments', async () => {
-  const input = { strategy: createAuctionStrategy(), model: { ...model, async score() { throw new Error('simulated timeout'); } }, seed: 2, opponentId: 'fixed', trajectories: 5, knowledge: {}, knowledgeStateMode: 'frozen', signal: new AbortController().signal };
-  const result = await new AuctionEvaluationAdapter().episode(input);
-  assert.equal(result.fallbacks, result.decisions); assert.equal(result.modelCalls, 5); assert(Number.isFinite(result.reward));
-  await assert.rejects(new AuctionEvaluationAdapter().episode({ ...input, trajectories: 0 }), { code: 'CONFIG_INVALID' });
+test('Evaluation accepts valid zero-confidence model decisions without replacing actions', async (t) => {
+  const actions = [];
+  const execute = AuctionDomain.prototype.execute;
+  t.mock.method(AuctionDomain.prototype, 'execute', function(command) { actions.push(command.action.id); return execute.call(this, command); });
+  const decisionModel = { ...model, async score(request) {
+    const response = await model.score(request);
+    for (const answer of Object.values(response.answers)) answer.confidence = 0;
+    return response;
+  } };
+  const result = await new AuctionEvaluationAdapter().episode({ strategy: createAuctionStrategy(), model: decisionModel, seed: 2, opponentId: 'fixed', trajectories: 5, knowledge: {}, knowledgeStateMode: 'frozen', signal: new AbortController().signal });
+  assert.equal(result.modelCalls, 5); assert.equal(result.decisions, 5);
+  assert.deepEqual(actions, Array(5).fill('bid-2'));
+});
+test('Evaluation stops before execution on model error, timeout or missing answers', async (t) => {
+  for (const [name, score] of [
+    ['error', async () => { throw new Error('model unavailable'); }],
+    ['timeout', async () => new Promise(() => {})],
+    ['missing', async () => ({ model: model.id, answers: {} })],
+  ]) await t.test(name, async (subtest) => {
+    let executions = 0;
+    subtest.mock.method(AuctionDomain.prototype, 'execute', async () => { executions++; throw new Error('Must never execute'); });
+    const input = { strategy: createAuctionStrategy(), model: { ...model, score }, seed: 2, opponentId: 'fixed', trajectories: 5, knowledge: {}, knowledgeStateMode: 'frozen', signal: new AbortController().signal };
+    await assert.rejects(new AuctionEvaluationAdapter({ maxDecisionMs: 60, executionReserveMs: 5 }).episode(input));
+    assert.equal(executions, 0);
+    await assert.rejects(new AuctionEvaluationAdapter().episode({ ...input, trajectories: 0 }), { code: 'CONFIG_INVALID' });
+  });
+});
+test('Evaluation requests a model answer even when the domain has one legal candidate', async (t) => {
+  const candidates = AuctionDomain.prototype.candidates;
+  t.mock.method(AuctionDomain.prototype, 'candidates', async function(observation) { return (await candidates.call(this, observation)).filter(action => action.id === 'bid-2'); });
+  let calls = 0;
+  const decisionModel = { ...model, async score(request) { calls++; assert(request.questions.every(question => question.actionId === 'bid-2')); return model.score(request); } };
+  const result = await new AuctionEvaluationAdapter().episode({ strategy: createAuctionStrategy(), model: decisionModel, seed: 2, opponentId: 'fixed', trajectories: 3, knowledge: {}, knowledgeStateMode: 'frozen', signal: new AbortController().signal });
+  assert.equal(calls, 3); assert.equal(result.decisions, 3);
 });
 test('Fresh simulator sessions cannot reuse persistent trajectory identities', async () => {
   const first = await new KuhnPokerDomain({ seed: 1 }).observe('s');
@@ -97,7 +126,7 @@ test('Fresh simulator sessions cannot reuse persistent trajectory identities', a
   const fixedB = await new AuctionDomain({ seed: 1, sessionId: 'reproducible-test' }).observe('s');
   assert.equal(fixedA.trajectoryId, fixedB.trajectoryId);
 });
-test('Evaluation does not turn a real model version mismatch into an apparently valid fallback result', async () => {
+test('Evaluation stops on a real model version mismatch', async () => {
   const wrongModel = { ...model, id: 'pinned-v1', kind: 'real', async score(request) { return { ...(await model.score(request)), model: 'unvalidated-v2' }; } };
   await assert.rejects(new AuctionEvaluationAdapter().episode({ strategy: createAuctionStrategy(), model: wrongModel, seed: 2, opponentId: 'fixed', trajectories: 1, knowledge: {}, knowledgeStateMode: 'frozen', signal: new AbortController().signal }), { code: 'VERSION_INCOMPATIBLE' });
 });

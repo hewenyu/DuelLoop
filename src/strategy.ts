@@ -11,8 +11,8 @@ function string(value: unknown, path: string): asserts value is string { invaria
 function finite(value: unknown, path: string): asserts value is number { invariant(typeof value === 'number' && Number.isFinite(value), 'STRATEGY_INVALID', `${path} must be finite`); }
 export function validateStrategy(input: unknown, domain?: DomainDefinition): StrategyPackage {
   canonicalize(input);
-  object(input, ['schemaVersion','strategyId','version','parentVersion','scope','stateProjection','questions','decision','exitConditions','fallback','provenance'], 'strategy');
-  invariant(input.schemaVersion === '1.0', 'VERSION_INCOMPATIBLE', 'Unsupported strategy schema');
+  object(input, ['schemaVersion','strategyId','version','parentVersion','scope','stateProjection','questions','decision','provenance'], 'strategy');
+  invariant(input.schemaVersion === '2.0', 'VERSION_INCOMPATIBLE', 'Strategy schema 2.0 requires model-only decisions');
   for (const name of ['strategyId','version']) string(input[name], name);
   if (input.parentVersion !== undefined) string(input.parentVersion, 'parentVersion');
   object(input.scope, ['domain','rulesVersion','featureContract'], 'scope');
@@ -32,12 +32,11 @@ export function validateStrategy(input: unknown, domain?: DomainDefinition): Str
     object(q.semantics, ['target','horizon','continuation','overlap'], 'semantics');
     for (const key of ['target','horizon','continuation','overlap']) string(q.semantics[key], key);
   }
-  object(input.decision, ['defaultWeights','branches','branchPolicy','aggregate','selection','minRequiredConfidence'], 'decision');
+  object(input.decision, ['defaultWeights','branches','branchPolicy','aggregate','selection'], 'decision');
   const d = input.decision;
   const weights = (w: unknown) => { object(w, [...ids], 'weights'); invariant(Object.keys(w).length === ids.size, 'STRATEGY_INVALID', 'Weights must cover every dimension'); for (const id of ids) finite(w[id], `weight.${id}`); };
   weights(d.defaultWeights);
   invariant(d.branchPolicy === 'first_match' && d.aggregate === 'weighted_sum', 'STRATEGY_INVALID', 'Unsupported combination mode');
-  finite(d.minRequiredConfidence, 'minRequiredConfidence'); invariant(d.minRequiredConfidence >= 0 && d.minRequiredConfidence <= 1, 'STRATEGY_INVALID', 'Confidence threshold outside [0,1]');
   object(d.selection, ['mode','tieBreak','temperature'], 'selection');
   invariant(['argmax','softmax_sample'].includes(d.selection.mode) && d.selection.tieBreak === 'domain_priority', 'STRATEGY_INVALID', 'Unsupported selection mode');
   if (d.selection.mode === 'softmax_sample') { finite(d.selection.temperature, 'temperature'); invariant(d.selection.temperature >= 1e-6 && d.selection.temperature <= 1e6, 'STRATEGY_INVALID', 'Temperature must be in [1e-6,1e6]'); }
@@ -68,8 +67,6 @@ export function validateStrategy(input: unknown, domain?: DomainDefinition): Str
   invariant(Array.isArray(d.branches) && d.branches.length <= STRATEGY_LIMITS.branches, 'STRATEGY_INVALID', 'Too many branches');
   const branches = new Set<string>();
   for (const b of d.branches) { object(b, ['id','when','weights'], 'branch'); string(b.id, 'branch.id'); invariant(!branches.has(b.id), 'STRATEGY_INVALID', 'Duplicate branch'); branches.add(b.id); condition(b.when); weights(b.weights); }
-  invariant(Array.isArray(input.exitConditions), 'STRATEGY_INVALID', 'exitConditions required'); for (const c of input.exitConditions) condition(c);
-  object(input.fallback, ['mode'], 'fallback'); invariant(input.fallback.mode === 'domain_baseline', 'STRATEGY_INVALID', 'Unsupported fallback');
   object(input.provenance, ['researchRunId','snapshotId','hypothesis'], 'provenance'); for (const k of ['researchRunId','snapshotId','hypothesis']) string(input.provenance[k], k);
   return structuredClone(input) as StrategyPackage;
 }
@@ -108,11 +105,22 @@ export function buildQuestions(strategy: StrategyPackage, observation: Observati
   invariant(Buffer.byteLength(canonicalize({state,questions})) <= STRATEGY_LIMITS.contextBytes, 'STRATEGY_INVALID', 'Context budget exceeded');
   return { state, questions, questionDigest: digest({state,questions}) };
 }
+/** Validate the answer contract; confidence is telemetry, never an acceptance threshold. */
+export function validateScoreAnswer(answer: unknown, levels: number): asserts answer is ScoreAnswer {
+  invariant(answer !== null && typeof answer === 'object' && !Array.isArray(answer), 'MODEL_INVALID', 'Missing or invalid Score answer');
+  const a = answer as ScoreAnswer;
+  invariant(Number.isInteger(levels) && levels >= 2 && levels <= 10 && Number.isFinite(a.score) && a.score >= 0 && a.score <= levels - 1 && Number.isFinite(a.confidence) && a.confidence >= 0 && a.confidence <= 1, 'MODEL_INVALID', 'Invalid Score value or confidence');
+  invariant(a.probabilities && typeof a.probabilities === 'object' && !Array.isArray(a.probabilities) && Object.keys(a.probabilities).length === levels, 'MODEL_INVALID', 'Invalid answer probability levels');
+  let sum = 0;
+  for (let i = 0; i < levels; i++) { const p = a.probabilities[String(i)]; invariant(Object.hasOwn(a.probabilities,String(i)) && Number.isFinite(p) && p! >= 0 && p! <= 1, 'MODEL_INVALID', 'Invalid answer probabilities'); sum += p!; }
+  invariant(Math.abs(sum - 1) <= 1e-3, 'MODEL_INVALID', 'Answer probabilities do not sum to one');
+}
 export function evaluateAnswers(strategy: StrategyPackage, observation: Observation, candidates: CandidateAction[], answers: Record<string, ScoreAnswer>, random = secureRandom, evaluatedAt = Date.now()) {
   invariant(candidates.length > 0 && new Set(candidates.map(a => a.id)).size === candidates.length, 'MODEL_INVALID', 'Candidates must have unique IDs');
   invariant(Number.isFinite(evaluatedAt), 'CONFIG_INVALID', 'Evaluation time must be finite');
   const features = { ...observation.features, 'observation.isStale': observation.deadline <= evaluatedAt };
-  invariant(!strategy.exitConditions.some(c => matchCondition(c,features) === true), 'MODEL_INVALID', 'Strategy exit condition matched');
+  invariant(answers && typeof answers === 'object' && !Array.isArray(answers), 'MODEL_INVALID', 'Missing model answers');
+  invariant(Object.keys(answers).length === candidates.length * strategy.questions.length, 'MODEL_INVALID', 'Model answer count differs from requested questions');
   const branch = strategy.decision.branches.find(b => matchCondition(b.when,features) === true);
   const weights = branch?.weights ?? strategy.decision.defaultWeights;
   const utilities: Record<string, number> = Object.create(null);
@@ -120,11 +128,7 @@ export function evaluateAnswers(strategy: StrategyPackage, observation: Observat
     let utility = 0;
     for (const q of strategy.questions) {
       const a = answers[`${q.id}:${candidate.id}`]; const top = q.criteria.length - 1;
-      invariant(a && Number.isFinite(a.score) && a.score >= 0 && a.score <= top && Number.isFinite(a.confidence) && a.confidence >= strategy.decision.minRequiredConfidence && a.confidence <= 1, 'MODEL_INVALID', 'Missing, invalid or low-confidence Score answer', {questionId:`${q.id}:${candidate.id}`});
-      invariant(a.probabilities && Object.keys(a.probabilities).length === top + 1, 'MODEL_INVALID', 'Invalid answer probability levels');
-      let sum = 0;
-      for (let i = 0; i <= top; i++) { const p = a.probabilities[String(i)]; invariant(p !== undefined && Number.isFinite(p) && p >= 0 && p <= 1, 'MODEL_INVALID', 'Invalid answer probabilities'); sum += p; }
-      invariant(Math.abs(sum-1) <= 1e-3, 'MODEL_INVALID', 'Answer probabilities do not sum to one');
+      validateScoreAnswer(a, top + 1);
       utility += weights[q.id]! * a.score / top;
     }
     invariant(Number.isFinite(utility), 'MODEL_INVALID', 'Nonfinite utility'); utilities[candidate.id] = utility;

@@ -1,7 +1,7 @@
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Features = Record<string, Json>;
 export type ExecutionMode = 'offline' | 'simulation' | 'shadow' | 'live';
-export type DecisionSource = 'strategy' | 'domain_baseline' | 'forced_action' | 'abstain';
+export type DecisionSource = 'strategy' | 'stopped';
 export interface Observation {
   applicationId: string; domainId: string; strategyScopeId: string; streamId: string;
   actorId: string; trajectoryId: string; revision: string; observedAt: number;
@@ -26,7 +26,7 @@ export interface FeedbackEvent {
 export interface DomainDefinition {
   id: string; rulesVersion: string; featureContract: string;
   featureBuilderVersion: string; knowledgeUpdaterVersion: string;
-  baselineVersion: string; continuationVersion: string;
+  continuationVersion: string;
   features: Record<string, FeatureSpec>; context: Features;
   capabilities: {
     execution: boolean; idempotency: boolean; statusQuery: boolean;
@@ -35,7 +35,6 @@ export interface DomainDefinition {
   };
   observe(streamId: string): Promise<Observation>;
   candidates(observation: Observation): Promise<CandidateAction[]>;
-  fallback(observation: Observation, reason: string): Promise<CandidateAction | null>;
   execute?(command: ActionCommand): Promise<ExecutionReceipt>;
   executionStatus?(idempotencyKey: string): Promise<ExecutionReceipt>;
   feedback?(): Promise<FeedbackEvent[]>;
@@ -50,7 +49,7 @@ export interface ScoreDimension {
   semantics: { target: string; horizon: string; continuation: string; overlap: string };
 }
 export interface StrategyPackage {
-  schemaVersion: '1.0'; strategyId: string; version: string; parentVersion?: string;
+  schemaVersion: '2.0'; strategyId: string; version: string; parentVersion?: string;
   scope: { domain: string; rulesVersion: string; featureContract: string };
   stateProjection: string[]; questions: ScoreDimension[];
   decision: {
@@ -58,9 +57,7 @@ export interface StrategyPackage {
     branches: { id: string; when: Condition; weights: Record<string, number> }[];
     branchPolicy: 'first_match'; aggregate: 'weighted_sum';
     selection: { mode: 'argmax' | 'softmax_sample'; tieBreak: 'domain_priority'; temperature?: number };
-    minRequiredConfidence: number;
   };
-  exitConditions: Condition[]; fallback: { mode: 'domain_baseline' };
   provenance: { researchRunId: string; snapshotId: string; hypothesis: string };
 }
 export interface ScoreQuestion { id: string; actionId: string; dimensionId: string; instructions: string; criteria: string[] }
@@ -74,7 +71,7 @@ export interface DecisionModel {
 }
 export interface BehaviorDependencies {
   model: string; runtime: string; rules: string; featureBuilder: string;
-  knowledgeUpdater: string; fallbackBaseline: string; continuationPolicy: string; contextDigest: string;
+  knowledgeUpdater: string; continuationPolicy: string; contextDigest: string;
 }
 export interface ReleaseBinding {
   strategyDigest: string; dependencies: BehaviorDependencies; scopeId: string;
@@ -84,7 +81,7 @@ export interface ReleaseBinding {
 export interface DecisionRecord {
   decisionId: string; observation: Observation; candidates: CandidateAction[];
   releaseDigest: string; strategyDigest: string; decisionSource: DecisionSource;
-  action: CandidateAction | null; fallbackReason?: string; fallbackBaselineDigest?: string;
+  action: CandidateAction | null; stopReason?: string;
   branchId?: string; questions: ScoreQuestion[]; answers: Record<string, ScoreAnswer>;
   utilities: Record<string, number>; probabilities: Record<string, number>;
   model?: string; modelKind?: 'real' | 'fixture'; usage?: ModelUsage;
@@ -111,17 +108,17 @@ export interface CandidateSubmission {
   regressionCases: BehaviorCase[]; knownRisks: string[];
 }
 export interface EvaluationProtocol {
-  version: '1.0'; id: string; domainId: string; seeds: number[];
+  version: '2.0'; id: string; domainId: string; seeds: number[];
   opponentIds: string[]; trajectoriesPerSeed: number;
   knowledgeStateMode: 'frozen' | 'online_update'; initialKnowledge: Features;
   metric: { name: string; direction: 'maximize' | 'minimize'; unit: string };
   minSamples: number; minimumImprovement: number; maxGroupRegression: number;
-  confidenceLevel: number; maxFallbackRate: number; maxP95LatencyMs: number;
+  confidenceLevel: number; maxP95LatencyMs: number;
   maxDevelopmentEvalRuns: number; maxFinalEvaluationsPerRun: number;
   holdoutId: string; maxHoldoutUses: number;
 }
 export interface EvaluationEpisode {
-  reward: number; decisions: number; fallbacks: number; latenciesMs: number[];
+  reward: number; decisions: number; latenciesMs: number[];
   modelCalls: number; usage?: ModelUsage;
 }
 export interface DecisionPolicy {
@@ -131,7 +128,7 @@ export interface EvaluationAdapter {
   id: string;
   /** Policy actually executed by the evaluator; must match the release runtime binding. */
   readonly decisionPolicy: DecisionPolicy;
-  /** Rules, feature/knowledge builders, baseline, continuation and context actually simulated. */
+  /** Rules, feature/knowledge builders, continuation and context actually simulated. */
   readonly domainDependencies: Omit<BehaviorDependencies, 'model' | 'runtime'>;
   episode(input: { strategy: StrategyPackage; model: DecisionModel; seed: number;
     opponentId: string; trajectories: number; knowledge: Features;
@@ -144,7 +141,7 @@ export interface ValidationReport {
   reasons: string[]; modelKind: 'real' | 'fixture'; stage: 'development' | 'final';
   sampleCount: number; meanDifference: number; lowerBound: number;
   groups: Record<string, { meanDifference: number; lowerBound: number }>;
-  fallbackRate: number; p95LatencyMs: number; createdAt: number;
+  p95LatencyMs: number; createdAt: number;
 }
 export interface ResearchTool { name: string; description: string; schema: Record<string, Json>; execute(input: unknown): Promise<Json> }
 export interface ResearchProvider {

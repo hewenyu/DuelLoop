@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { DuelLoopError, invariant } from './errors.js';
+import { invariant } from './errors.js';
 import { digest, seededRandom, withDeadline } from './utils.js';
-import { buildQuestions, compileStrategy, evaluateAnswers, matchCondition } from './strategy.js';
-import type { ActionCommand, CandidateAction, DecisionModel, DecisionPolicy, DomainDefinition, EvaluationAdapter, EvaluationEpisode, ExecutionReceipt, Features, FeedbackEvent, Observation, StrategyPackage } from './types.js';
+import { buildQuestions, compileStrategy, evaluateAnswers } from './strategy.js';
+import type { ActionCommand, CandidateAction, DecisionPolicy, DomainDefinition, EvaluationAdapter, EvaluationEpisode, ExecutionReceipt, Features, FeedbackEvent, Observation, StrategyPackage } from './types.js';
 
 export interface SimulationOptions {
   applicationId?: string; scopeId?: string; seed?: number; opponentId?: string; sessionId?: string;
@@ -14,7 +14,7 @@ abstract class SimulationDomain<S extends BaseState> {
   readonly rulesVersion = '1';
   abstract readonly featureContract: string;
   readonly featureBuilderVersion = '1'; readonly knowledgeUpdaterVersion = '1';
-  readonly baselineVersion = '1'; readonly continuationVersion = '1';
+  readonly continuationVersion = '1';
   protected readonly states = new Map<string, S>();
   protected readonly receipts = new Map<string, { commandDigest: string; receipt: ExecutionReceipt }>();
   protected readonly pending: FeedbackEvent[] = [];
@@ -138,11 +138,6 @@ export class KuhnPokerDomain extends SimulationDomain<KuhnState> implements Doma
   async candidates(observation: Observation): Promise<CandidateAction[]> {
     return this.legalKinds(this.current(observation)).map(kind => ({ id: kind, kind, parameters: {}, revision: observation.revision }));
   }
-  async fallback(observation: Observation, _reason: string): Promise<CandidateAction | null> {
-    const actions = await this.candidates(observation); const strong = observation.features['self.card'] === 'K';
-    const preferred = strong ? (actions.some(a => a.id === 'call') ? 'call' : 'bet') : (actions.some(a => a.id === 'fold') ? 'fold' : 'check');
-    return actions.find(a => a.id === preferred) ?? null;
-  }
   async execute(command: ActionCommand): Promise<ExecutionReceipt> {
     const previous = this.previous(command); if (previous) return previous;
     const state = this.validateCommand(command, await this.candidates(command.observation)); state.lastDecision = command.decisionId;
@@ -188,10 +183,6 @@ export class AuctionDomain extends SimulationDomain<AuctionState> implements Dom
     const state = this.current(observation); if (state.done) return [];
     return [0, 1, 2, 3].map(bid => ({ id: bid ? `bid-${bid}` : 'pass', kind: bid ? 'bid' : 'pass', parameters: { bid }, revision: observation.revision }));
   }
-  async fallback(observation: Observation, _reason: string): Promise<CandidateAction | null> {
-    const bid = Math.max(0, Math.min(3, Number(observation.features['self.value']) - 1));
-    return (await this.candidates(observation)).find(a => a.parameters.bid === bid) ?? null;
-  }
   async execute(command: ActionCommand): Promise<ExecutionReceipt> {
     const previous = this.previous(command); if (previous) return previous;
     const state = this.validateCommand(command, await this.candidates(command.observation));
@@ -212,7 +203,7 @@ export class AuctionDomain extends SimulationDomain<AuctionState> implements Dom
 }
 
 function initialStrategy(domain: DomainDefinition): StrategyPackage {
-  return { schemaVersion: '1.0', strategyId: `${domain.id}-initial`, version: 'v1',
+  return { schemaVersion: '2.0', strategyId: `${domain.id}-initial`, version: 'v1',
     scope: { domain: domain.id, rulesVersion: domain.rulesVersion, featureContract: domain.featureContract }, stateProjection: Object.keys(domain.features),
     questions: [
       { id: 'gain', type: 'score', forEach: 'candidate', normalization: 'divide_by_max_level',
@@ -223,8 +214,8 @@ function initialStrategy(domain: DomainDefinition): StrategyPackage {
         instructions: 'Evaluate risk of losing newly committed resources after {{candidate.id}} under the reference continuation. Exclude sunk resources.',
         semantics: { target: 'loss_of_newly_committed_resources', horizon: 'current_trajectory_end', continuation: 'domain reference continuation v1', overlap: 'intentional extra downside preference; not statistically independent of gain' },
         criteria: ['No additional commitment or rules guarantee no loss on it', 'Additional commitment is mainly supported by visible value or card strength', 'Evidence for preserving and losing new commitment is balanced', 'Visible weakness or opponent participation supports loss of new commitment', 'Rules or strong public evidence make loss of newly committed resources nearly certain'] },
-    ], decision: { defaultWeights: { gain: 1, exposure: -0.3 }, branches: [], branchPolicy: 'first_match', aggregate: 'weighted_sum', selection: { mode: 'argmax', tieBreak: 'domain_priority' }, minRequiredConfidence: 0.55 },
-    exitConditions: [], fallback: { mode: 'domain_baseline' }, provenance: { researchRunId: 'bootstrap', snapshotId: 'bootstrap', hypothesis: 'Initial illustrative risk preference; confidence threshold is not a domain-calibrated default' } };
+    ], decision: { defaultWeights: { gain: 1, exposure: -0.3 }, branches: [], branchPolicy: 'first_match', aggregate: 'weighted_sum', selection: { mode: 'argmax', tieBreak: 'domain_priority' } },
+    provenance: { researchRunId: 'bootstrap', snapshotId: 'bootstrap', hypothesis: 'Initial illustrative risk preference; every actual action requires a valid model response' } };
 }
 export function createKuhnStrategy(): StrategyPackage { return initialStrategy(new KuhnPokerDomain()); }
 export function createAuctionStrategy(): StrategyPackage {
@@ -242,30 +233,22 @@ async function simulate(factory: (options: SimulationOptions) => DomainDefinitio
     knowledge: structuredClone(input.knowledge), knowledgeStateMode: input.knowledgeStateMode, decisionTimeoutMs: maxDecisionMs, sessionId: `evaluation:${input.seed}` });
   const strategy = compileStrategy(input.strategy, domain).strategy;
   const random = seededRandom(`${input.seed}:selection`);
-  const result: EvaluationEpisode = { reward: 0, decisions: 0, fallbacks: 0, latenciesMs: [], modelCalls: 0, usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 } };
+  const result: EvaluationEpisode = { reward: 0, decisions: 0, latenciesMs: [], modelCalls: 0, usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 } };
   const settled = new Set<string>();
   // Every call constructs independent domain/opponent/knowledge state, including paired baseline/candidate calls.
   while (settled.size < input.trajectories) {
     invariant(!input.signal.aborted, 'CANCELLED', 'Evaluation cancelled');
     const observation = await domain.observe('evaluation'); const candidates = await domain.candidates(observation);
-    const started = Date.now(); let action: CandidateAction | null;
-    try {
-      invariant(!strategy.exitConditions.some(condition => matchCondition(condition, { ...observation.features, 'observation.isStale': observation.deadline <= Date.now() }) === true), 'MODEL_INVALID', 'Strategy exit condition matched');
-      const request = buildQuestions(strategy, observation, candidates, domain); result.modelCalls++;
-      const response = await withDeadline(observation.deadline - reserve, signal => input.model.score({ state: request.state, questions: request.questions, signal }), input.signal);
-      invariant(response.model === input.model.id || input.model.kind === 'fixture', 'VERSION_INCOMPATIBLE', 'Evaluation model returned a different version');
-      if (response.usage) {
-        result.usage!.inputTokens! += response.usage.inputTokens ?? 0; result.usage!.outputTokens! += response.usage.outputTokens ?? 0;
-        result.usage!.costUsd! += response.usage.costUsd ?? 0; if (response.usage.unknown) result.usage!.unknown = true;
-      } else result.usage!.unknown = true;
-      action = evaluateAnswers(strategy, observation, candidates, response.answers, timing.randomSeed === undefined ? random : seededRandom(`${timing.randomSeed}:${observation.trajectoryId}:${observation.revision}`)).action;
-    } catch (error) {
-      if (error instanceof DuelLoopError && ['VERSION_INCOMPATIBLE', 'STORAGE_FAILURE', 'CANCELLED'].includes(error.code)) throw error;
-      result.usage!.unknown = true;
-      invariant(!input.signal.aborted, 'CANCELLED', 'Evaluation cancelled');
-      action = await domain.fallback(observation, error instanceof Error ? error.message : 'model failure'); result.fallbacks++;
-    }
-    invariant(action, 'VALIDATION_REJECTED', 'Evaluation domain returned no action');
+    const started = Date.now();
+    const request = buildQuestions(strategy, observation, candidates, domain); result.modelCalls++;
+    const response = await withDeadline(observation.deadline - reserve, signal => input.model.score({ state: request.state, questions: request.questions, signal }), input.signal);
+    invariant(response.model === input.model.id || input.model.kind === 'fixture', 'VERSION_INCOMPATIBLE', 'Evaluation model returned a different version');
+    if (response.usage) {
+      result.usage!.inputTokens! += response.usage.inputTokens ?? 0; result.usage!.outputTokens! += response.usage.outputTokens ?? 0;
+      result.usage!.costUsd! += response.usage.costUsd ?? 0; if (response.usage.unknown) result.usage!.unknown = true;
+    } else result.usage!.unknown = true;
+    const action = evaluateAnswers(strategy, observation, candidates, response.answers, timing.randomSeed === undefined ? random : seededRandom(`${timing.randomSeed}:${observation.trajectoryId}:${observation.revision}`)).action;
+    invariant(!input.signal.aborted, 'CANCELLED', 'Evaluation cancelled');
     result.decisions++; result.latenciesMs.push(Date.now() - started);
     const decisionId = `eval:${input.seed}:${result.decisions}`;
     const receipt = await domain.execute!({ decisionId, idempotencyKey: decisionId, expectedStateRevision: observation.revision, observation, action, deadline: observation.deadline });
@@ -291,17 +274,17 @@ function evaluationPolicy(timing: EvaluationSimulationOptions): DecisionPolicy {
 export class KuhnEvaluationAdapter implements EvaluationAdapter {
   readonly id: string; readonly decisionPolicy: DecisionPolicy;
   readonly domainDependencies = evaluationDomainDependencies(new KuhnPokerDomain());
-  constructor(timing: EvaluationSimulationOptions = {}) { this.decisionPolicy = evaluationPolicy(timing); this.id = `kuhn-evaluation-v1:${digest({ decisionPolicy: this.decisionPolicy, domainDependencies: this.domainDependencies })}`; }
+  constructor(timing: EvaluationSimulationOptions = {}) { this.decisionPolicy = evaluationPolicy(timing); this.id = `kuhn-evaluation-v2:${digest({ decisionPolicy: this.decisionPolicy, domainDependencies: this.domainDependencies })}`; }
   episode(input: Parameters<EvaluationAdapter['episode']>[0]): Promise<EvaluationEpisode> { return simulate(options => new KuhnPokerDomain(options), input, this.decisionPolicy); }
 }
 export class AuctionEvaluationAdapter implements EvaluationAdapter {
   readonly id: string; readonly decisionPolicy: DecisionPolicy;
   readonly domainDependencies = evaluationDomainDependencies(new AuctionDomain());
-  constructor(timing: EvaluationSimulationOptions = {}) { this.decisionPolicy = evaluationPolicy(timing); this.id = `auction-evaluation-v1:${digest({ decisionPolicy: this.decisionPolicy, domainDependencies: this.domainDependencies })}`; }
+  constructor(timing: EvaluationSimulationOptions = {}) { this.decisionPolicy = evaluationPolicy(timing); this.id = `auction-evaluation-v2:${digest({ decisionPolicy: this.decisionPolicy, domainDependencies: this.domainDependencies })}`; }
   episode(input: Parameters<EvaluationAdapter['episode']>[0]): Promise<EvaluationEpisode> { return simulate(options => new AuctionDomain(options), input, this.decisionPolicy); }
 }
 function evaluationDomainDependencies(domain: DomainDefinition): EvaluationAdapter['domainDependencies'] {
   return Object.freeze({ rules: domain.rulesVersion, featureBuilder: domain.featureBuilderVersion,
-    knowledgeUpdater: domain.knowledgeUpdaterVersion, fallbackBaseline: domain.baselineVersion,
+    knowledgeUpdater: domain.knowledgeUpdaterVersion,
     continuationPolicy: domain.continuationVersion, contextDigest: digest(domain.context) });
 }

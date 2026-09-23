@@ -1,22 +1,30 @@
 import { randomUUID } from 'node:crypto';
 import { DuelLoopError, invariant } from './errors.js';
-import { buildQuestions, compileStrategy, evaluateAnswers, matchCondition } from './strategy.js';
+import { buildQuestions, compileStrategy, evaluateAnswers, validateScoreAnswer } from './strategy.js';
 import { canonicalize, digest, seededRandom, withDeadline } from './utils.js';
-import type { ActionCommand, BehaviorDependencies, CandidateAction, DecisionModel, DecisionRecord, DomainDefinition, DuelLoopStore, ExecutionMode, ExecutionReceipt, FeedbackEvent, JournalEvent, Observation, StrategyPackage, ValidationReport } from './types.js';
+import type { ActionCommand, BehaviorDependencies, CandidateAction, DecisionModel, DecisionRecord, DomainDefinition, DuelLoopStore, ExecutionMode, ExecutionReceipt, FeedbackEvent, JournalEvent, ModelUsage, Observation, StrategyPackage, ValidationReport } from './types.js';
 
 export interface DuelLoopOptions {
   applicationId: string; domain: DomainDefinition; model: DecisionModel; store: DuelLoopStore;
   mode?: ExecutionMode; executionOwner?: 'framework'|'host';
   maxDecisionMs?: number; executionReserveMs?: number; randomSeed?: string;
 }
-export const RUNTIME_VERSION = 'duelloop-runtime-2';
+export const RUNTIME_VERSION = 'duelloop-runtime-3';
+function measuredUsage(value:unknown):ModelUsage {
+  const usage=value&&typeof value==='object'?value as Record<string,unknown>:{};
+  const known=(key:string)=>Number.isSafeInteger(usage[key])&&(usage[key] as number)>=0;
+  return {unknown:usage.unknown===true||!known('inputTokens')||!known('outputTokens'),
+    ...(known('inputTokens')?{inputTokens:usage.inputTokens as number}:{}),
+    ...(known('outputTokens')?{outputTokens:usage.outputTokens as number}:{}),
+    ...(typeof usage.costUsd==='number'&&Number.isFinite(usage.costUsd)&&usage.costUsd>=0?{costUsd:usage.costUsd}:{})};
+}
 export function decisionPolicyRuntimeVersion(timing:{maxDecisionMs?:number;executionReserveMs?:number;randomSeed?:string}={}):string {
   const policy={maxDecisionMs:timing.maxDecisionMs??5000,executionReserveMs:timing.executionReserveMs??25,randomSeed:timing.randomSeed??null};
   return `${RUNTIME_VERSION}:${digest(policy)}`;
 }
 export function behaviorDependencies(domain:DomainDefinition,model:DecisionModel,timing:{maxDecisionMs?:number;executionReserveMs?:number;randomSeed?:string}={}):BehaviorDependencies {
   return {model:model.id,runtime:decisionPolicyRuntimeVersion(timing),rules:domain.rulesVersion,featureBuilder:domain.featureBuilderVersion,
-    knowledgeUpdater:domain.knowledgeUpdaterVersion,fallbackBaseline:domain.baselineVersion,
+    knowledgeUpdater:domain.knowledgeUpdaterVersion,
     continuationPolicy:domain.continuationVersion,contextDigest:digest(domain.context)};
 }
 export class DuelLoop {
@@ -25,6 +33,7 @@ export class DuelLoop {
   private readonly ownerId=randomUUID(); private readonly owners=new Map<string,string>();
   private readonly listeners=new Set<(event:JournalEvent)=>void>(); private readonly busy=new Set<string>();
   private stopping=false; private closed=false; private readonly pending=new Set<Promise<unknown>>();
+  private failure?:{decisionId:string;code:string};
   private maxDecisionMs:number; private reserve:number; private randomSeed?:string;
   constructor(options:DuelLoopOptions) {
     invariant(options.applicationId?.length>0,'CONFIG_INVALID','applicationId required');
@@ -67,6 +76,7 @@ export class DuelLoop {
     this.emit('runtime.rolled_back',scopeId,{releaseDigest:target});
   }
   async decide(observation:Observation,candidates?:CandidateAction[]):Promise<DecisionRecord> {
+    invariant(!this.failure,'DECISION_STOPPED','Runtime failed; inspect the stopped decision before creating a new instance',this.failure);
     this.ensureOpen();invariant(!this.stopping,'CANCELLED','Runtime stopped accepting decisions');
     const startedAt=Date.now();const deadline=Math.min(observation.deadline,startedAt+this.maxDecisionMs);
     this.validateObservation(observation);
@@ -79,35 +89,51 @@ export class DuelLoop {
     invariant(digest(binding.dependencies)===digest(this.dependencies),'VERSION_INCOMPATIBLE','Bound release is incompatible with current runtime');
     const strategy=compileStrategy(this.store.getArtifact<StrategyPackage>(binding.strategyDigest),this.domain).strategy;
     const record:DecisionRecord={decisionId:randomUUID(),observation:{...structuredClone(observation),deadline},candidates:structuredClone(actions),releaseDigest,strategyDigest:binding.strategyDigest,
-      decisionSource:'abstain',action:null,questions:[],answers:{},utilities:{},probabilities:{},startedAt,finishedAt:startedAt};
-    if(actions.length===1){record.decisionSource='forced_action';record.action=actions[0]!;record.probabilities={[actions[0]!.id]:1};}
-    else if(actions.length>1) {
-      try {
-        const features={...observation.features,'observation.isStale':observation.deadline<=Date.now()};
-        invariant(!strategy.exitConditions.some(c=>matchCondition(c,features)===true),'MODEL_INVALID','Strategy exit condition matched');
+      decisionSource:'stopped',action:null,questions:[],answers:{},utilities:{},probabilities:{},startedAt,finishedAt:startedAt};
+    try {
+        invariant(actions.length>0,'DECISION_STOPPED','No legal candidate; no action was selected',{reason:'NO_LEGAL_ACTION'});
         const request=buildQuestions(strategy,observation,actions,this.domain);record.questions=request.questions;
         record.modelKind=this.model.kind;record.model=this.model.id;
-        const response=await withDeadline(deadline-this.reserve,signal=>this.model.score({...request,signal}));
-        record.answers=response.answers;record.model=response.model;if(response.usage)record.usage=response.usage;
+        const response=await withDeadline(deadline-this.reserve,signal=>{
+          invariant(!this.stopping,'CANCELLED','Runtime stopped before model request');
+          const pending=this.model.score({...request,signal});
+          const late=(usage:unknown,outcome:'completed'|'failed')=>{
+            if(!signal.aborted)return;
+            // Late accounting never mutates the immutable stopped decision or resumes execution.
+            try{this.emit('decision.late_model_result',observation.strategyScopeId,{decisionId:record.decisionId,model:this.model.id,outcome,usage:measuredUsage(usage)});}
+            catch{/* The host may already have closed the store after the failed step. */}
+          };
+          void pending.then(value=>late(value?.usage,'completed'),error=>late(error instanceof DuelLoopError?error.context.usage:undefined,'failed'));
+          return pending;
+        });
+        record.usage=measuredUsage(response?.usage);
+        invariant(response&&typeof response.model==='string'&&response.model.length>0,'MODEL_INVALID','Model response identity is missing');
+        record.model=response.model;
         invariant(response.model===this.model.id || this.model.kind==='fixture','VERSION_INCOMPATIBLE','Model returned a different version; rebind and revalidate before use',{requested:this.model.id,actual:response.model});
-        const seed=this.randomSeed===undefined?undefined:`${this.randomSeed}:${observation.trajectoryId}:${observation.revision}`;
-        const result=evaluateAnswers(strategy,observation,actions,response.answers,seed===undefined?undefined:seededRandom(seed));
-        Object.assign(record,result,{decisionSource:'strategy'});if(seed!==undefined)record.randomSeed=seed;
-      } catch(error) {
-        if(error instanceof DuelLoopError && ['VERSION_INCOMPATIBLE','STORAGE_FAILURE','CANCELLED'].includes(error.code))throw error;
-        const reason=error instanceof DuelLoopError?error.code:'MODEL_INVALID';
-        record.fallbackReason=reason;record.fallbackBaselineDigest=digest({domain:this.domain.id,baseline:this.domain.baselineVersion});
-        const measured=error instanceof DuelLoopError?error.context.usage as {inputTokens?:number;outputTokens?:number;costUsd?:number;unknown?:boolean}|undefined:undefined;
-        if(!record.usage&&measured&&Number.isSafeInteger(measured.inputTokens)&&measured.inputTokens!>=0&&Number.isSafeInteger(measured.outputTokens)&&measured.outputTokens!>=0) {
-          record.usage={inputTokens:measured.inputTokens!,outputTokens:measured.outputTokens!,unknown:measured.unknown===true,
-            ...(Number.isFinite(measured.costUsd)&&measured.costUsd!>=0?{costUsd:measured.costUsd!}:{})};
+        invariant(response.answers&&typeof response.answers==='object'&&!Array.isArray(response.answers),'MODEL_INVALID','Missing model answers');
+        invariant(Object.keys(response.answers).length===request.questions.length,'MODEL_INVALID','Model answer count differs from requested questions');
+        for(const question of request.questions){
+          const answer=response.answers[question.id];validateScoreAnswer(answer,question.criteria.length);
+          // Persist only validated JSON fields, including valid answers preceding a malformed one.
+          record.answers[question.id]={score:answer.score,confidence:answer.confidence,probabilities:{...answer.probabilities}};
         }
-        if(record.model)record.usage={...record.usage,unknown:record.usage?.unknown??true};
-        if(Date.now()<deadline){record.action=await withDeadline(deadline,()=>this.domain.fallback(observation,reason));}
-        if(record.action){invariant(actions.some(a=>canonicalize(a)===canonicalize(record.action)),'CONFIG_INVALID','Fallback returned illegal action');record.decisionSource='domain_baseline';record.probabilities={[record.action.id]:1};}
-      }
+        invariant(!this.stopping,'CANCELLED','Runtime stopped while the model was answering');
+        invariant(Date.now()<deadline,'MODEL_TIMEOUT','Decision expired before model answers could be used');
+        const seed=this.randomSeed===undefined?undefined:`${this.randomSeed}:${observation.trajectoryId}:${observation.revision}`;
+        const result=evaluateAnswers(strategy,observation,actions,record.answers,seed===undefined?undefined:seededRandom(seed));
+        Object.assign(record,result,{decisionSource:'strategy'});if(seed!==undefined)record.randomSeed=seed;
+    } catch(error) {
+      const failure=error instanceof DuelLoopError?error:new DuelLoopError('MODEL_INVALID','Decision model failed');
+      record.decisionSource='stopped';record.action=null;record.utilities={};record.probabilities={};
+      record.stopReason=typeof failure.context.reason==='string'?failure.context.reason:failure.code;
+      if(!record.usage&&failure.context.usage)record.usage=measuredUsage(failure.context.usage);
+      if(record.model&&!record.usage)record.usage={unknown:true};
+      record.finishedAt=Date.now();
+      this.stopping=true;this.failure??={decisionId:record.decisionId,code:record.stopReason};
+      this.store.putArtifact('decision',record);this.emit('decision',observation.strategyScopeId,record);
+      this.emit('runtime.stopped',observation.strategyScopeId,{decisionId:record.decisionId,reason:record.stopReason});
+      throw new DuelLoopError(failure.code,failure.message,{...failure.context,decisionId:record.decisionId,stopReason:record.stopReason});
     }
-    if(Date.now()>=deadline){record.action=null;record.decisionSource='abstain';record.fallbackReason='MODEL_TIMEOUT';}
     record.finishedAt=Date.now();this.store.putArtifact('decision',record);this.emit('decision',observation.strategyScopeId,record);return record;
   }
   async step(streamId:string):Promise<{decision:DecisionRecord;receipt:ExecutionReceipt|null}> {
@@ -131,9 +157,16 @@ export class DuelLoop {
     const existing=this.store.intents(decision.observation.strategyScopeId).find(i=>i.decisionId===decision.decisionId);
     if(existing?.receipt)return existing.receipt;
     const command=await this.prepareExecution(decision);
-    let receipt:ExecutionReceipt;
-    try {receipt=await withDeadline(command.deadline,()=>this.domain.execute!(command));}
-    catch {receipt={decisionId:decision.decisionId,idempotencyKey:decision.decisionId,status:'unknown',timestamp:Date.now()};}
+    let receipt:ExecutionReceipt;let sent=false;
+    try {receipt=await withDeadline(command.deadline,()=>{
+      invariant(!this.stopping,'CANCELLED','Runtime stopped before sending the action');
+      sent=true;return this.domain.execute!(command);
+    });}
+    catch(error){
+      receipt={decisionId:decision.decisionId,idempotencyKey:decision.decisionId,status:sent?'unknown':'rejected',timestamp:Date.now(),
+        ...(!sent?{details:{reason:'STOPPED_BEFORE_SEND'}}:{})};
+      if(!sent){this.store.recordReceipt(receipt);throw error;}
+    }
     invariant(receipt.decisionId===decision.decisionId&&receipt.idempotencyKey===decision.decisionId,'EXECUTION_UNKNOWN','Receipt does not match intent');
     this.store.recordReceipt(receipt);return receipt;
   }
@@ -143,6 +176,7 @@ export class DuelLoop {
   }
   private async prepareExecution(decision:DecisionRecord):Promise<ActionCommand>{
     invariant(!this.stopping,'CANCELLED','Runtime stopped accepting execution');
+    invariant(decision.decisionSource==='strategy'&&!decision.stopReason&&decision.model&&decision.questions.length>0,'ACCESS_DENIED','Only a successful model decision may execute');
     invariant(decision.action,'CONFIG_INVALID','No action to execute');
     const obs=decision.observation;this.validateObservation(obs);this.store.bindScope(obs.strategyScopeId,this.applicationId);
     this.store.assertReleaseEligible(decision.releaseDigest,this.dependencies);
@@ -201,6 +235,7 @@ export class DuelLoop {
     }return receipts;
   }
   async start(options:{streamIds:string[];maxSteps?:number;intervalMs?:number;signal?:AbortSignal}):Promise<void> {
+    invariant(!this.failure,'DECISION_STOPPED','Runtime failure cannot be cleared by restarting the loop',this.failure);
     invariant(options.streamIds.length>0,'CONFIG_INVALID','At least one stream required');this.stopping=false;
     for(let n=0;n<(options.maxSteps??Infinity)&&!this.stopping&&!options.signal?.aborted;n++) {
       for(const stream of options.streamIds){if(this.stopping||options.signal?.aborted)break;await this.step(stream);}
@@ -211,7 +246,7 @@ export class DuelLoop {
     this.stopping=true;if(options.drain!==false&&this.pending.size)await withDeadline(Date.now()+(options.timeoutMs??this.maxDecisionMs),()=>Promise.allSettled([...this.pending]));
   }
   subscribe(listener:(event:JournalEvent)=>void):()=>void{this.listeners.add(listener);return()=>this.listeners.delete(listener);}
-  status(){return {applicationId:this.applicationId,domainId:this.domain.id,mode:this.mode,executionOwner:this.executionOwner,stopping:this.stopping,pendingSteps:this.pending.size,unresolvedExecutions:this.store.intents().filter(i=>i.command.observation.applicationId===this.applicationId&&i.command.observation.domainId===this.domain.id&&(!i.receipt||['accepted','unknown'].includes(i.receipt.status))).length};}
+  status(){return {applicationId:this.applicationId,domainId:this.domain.id,mode:this.mode,executionOwner:this.executionOwner,stopping:this.stopping,...(this.failure?{failure:{...this.failure}}:{}),pendingSteps:this.pending.size,unresolvedExecutions:this.store.intents().filter(i=>i.command.observation.applicationId===this.applicationId&&i.command.observation.domainId===this.domain.id&&(!i.receipt||['accepted','unknown'].includes(i.receipt.status))).length};}
   async close():Promise<void>{if(this.closed)return;await this.stop();for(const [key,token] of this.owners){const [scope,stream]=key.split('\0');this.store.releaseOwner(scope!,stream!,token);}this.closed=true;this.listeners.clear();}
   private emit(type:string,scopeId:string,data:unknown){const event=this.store.appendEvent(type,scopeId,data);for(const listener of this.listeners){try{listener(event);}catch{/* Observer failures never trigger action retries. */}}}
   private ensureOpen(){invariant(!this.closed,'CONFIG_INVALID','Runtime closed');}

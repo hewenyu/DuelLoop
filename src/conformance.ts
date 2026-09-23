@@ -9,14 +9,15 @@ export interface ConformanceOptions {
   forbiddenFeaturePaths?: string[];
   /** Factories must return isolated sandbox instances; this suite executes real adapter methods. */
   noActionFixture?: () => Promise<{ domain: DomainDefinition; observation: Observation }>;
-  forcedActionFixture?: () => Promise<{ domain: DomainDefinition; observation: Observation }>;
+  singleCandidateFixture?: () => Promise<{ domain: DomainDefinition; observation: Observation }>;
   maxSteps?: number;
 }
 function check(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
 function command(observation: Observation, action: ActionCommand['action'], key: string): ActionCommand {
   return { observation, action, decisionId: key, idempotencyKey: key, expectedStateRevision: observation.revision, deadline: observation.deadline };
 }
-/** Installable domain-contract checks. Run only on sandbox/resettable factories, never a production execution adapter. */
+/** The selected first candidate is only a sandbox contract-test input, never a runtime action policy.
+ * Installable domain-contract checks. Run only on sandbox/resettable factories, never a production execution adapter. */
 export async function runDomainConformance(factory: () => DomainDefinition | Promise<DomainDefinition>, options: ConformanceOptions = {}): Promise<ConformanceReport> {
   const initial = await factory(); const stream = options.streamId ?? 'conformance';
   const checks: ConformanceCheck[] = [];
@@ -46,9 +47,6 @@ export async function runDomainConformance(factory: () => DomainDefinition | Pro
     const actions = await domain.candidates(observation);
     check(new Set(actions.map(a => a.id)).size === actions.length, 'Duplicate action ID');
     check(actions.every(a => a.revision === observation.revision), 'Action revision mismatch');
-    const fallback = await domain.fallback(observation, 'conformance');
-    check(fallback ? actions.some(a => digest(a) === digest(fallback)) : actions.length === 0, 'Fallback is outside the legal set');
-    check(digest(fallback) === digest(await domain.fallback(observation, 'conformance')), 'Fallback must be deterministic for identical state');
   });
   await run('actor-visibility', async () => {
     const domain = await factory(); const observation = await domain.observe(stream);
@@ -61,7 +59,7 @@ export async function runDomainConformance(factory: () => DomainDefinition | Pro
     check(digest(await first.candidates(a)) === digest(await second.candidates(b)), 'Reset legal candidates differ');
   });
   await run('legal-execution-idempotency-status', async () => {
-    const domain = await factory(); const observation = await domain.observe(stream); const action = await domain.fallback(observation, 'conformance');
+    const domain = await factory(); const observation = await domain.observe(stream); const action = (await domain.candidates(observation))[0];
     check(action, 'Fixture must supply an actionable state');
     const cmd = command(observation, action, 'conformance-execute'); const receipt = await domain.execute!(cmd);
     check(['accepted', 'completed', 'unknown'].includes(receipt.status), 'Legal action rejected');
@@ -77,7 +75,7 @@ export async function runDomainConformance(factory: () => DomainDefinition | Pro
   if (!initial.capabilities.idempotency) checks.push({ name: 'idempotent-retry', status: 'skipped', detail: 'Idempotency not declared; automatic replay is disabled' });
   if (!initial.capabilities.statusQuery) checks.push({ name: 'unknown-receipt-reconciliation', status: 'skipped', detail: 'Status lookup not declared; unknown execution requires host reconciliation' });
   await run('stale-state-rejected', async () => {
-    const domain = await factory(); const observation = await domain.observe(stream); const action = await domain.fallback(observation, 'conformance');
+    const domain = await factory(); const observation = await domain.observe(stream); const action = (await domain.candidates(observation))[0];
     check(action, 'Fixture must supply an actionable state');
     let rejected = false;
     try { const receipt = await domain.execute!({ ...command(observation, action, 'stale'), expectedStateRevision: 'non-current-revision' }); rejected = receipt.status === 'rejected'; }
@@ -95,7 +93,7 @@ export async function runDomainConformance(factory: () => DomainDefinition | Pro
   await run('feedback-and-revisions', async () => {
     const domain = await factory(); const seen = new Map<string, number>(); let settled = false; let revised = false; let provisional = false;
     for (let step = 0; step < (options.maxSteps ?? 8) && (!settled || (domain.capabilities.revisedFeedback && !revised)); step++) {
-      const observation = await domain.observe(stream); const action = await domain.fallback(observation, 'conformance');
+      const observation = await domain.observe(stream); const action = (await domain.candidates(observation))[0];
       if (action) await domain.execute!(command(observation, action, `feedback:${step}`));
       for (let poll = 0; poll < 4; poll++) for (const event of await domain.feedback!()) {
         check(event.applicationId === observation.applicationId && event.strategyScopeId === observation.strategyScopeId, 'Feedback application/scope mismatch');
@@ -111,17 +109,17 @@ export async function runDomainConformance(factory: () => DomainDefinition | Pro
   }, initial.capabilities.execution && initial.feedback ? undefined : 'No sandbox execution/feedback capability');
   await run('instance-knowledge-isolation', async () => {
     const a = await factory(); const b = await factory(); const before = await b.observe(stream); const obs = await a.observe(stream);
-    const action = await a.fallback(obs, 'conformance'); if (action) await a.execute!(command(obs, action, 'isolation'));
+    const action = (await a.candidates(obs))[0]; if (action) await a.execute!(command(obs, action, 'isolation'));
     const after = await b.observe(stream); check(digest(before.features) === digest(after.features) && before.revision === after.revision, 'Executing one instance changed another instance');
   }, initial.capabilities.execution ? undefined : 'No execution capability');
   await run('scope-checkpoint', async () => {
     const domain = await factory(); const observation = await domain.observe(stream);
     check(!(await domain.canActivate!(observation.strategyScopeId)), 'Scope activated while action was outstanding');
-    const action = await domain.fallback(observation, 'conformance'); check(action, 'Checkpoint fixture needs an action');
+    const action = (await domain.candidates(observation))[0]; check(action, 'Checkpoint fixture needs an action');
     await domain.execute!(command(observation, action, 'boundary'));
     check(await domain.canActivate!(observation.strategyScopeId), 'Confirmed checkpoint did not permit scope activation');
   }, initial.capabilities.activationBoundary === 'scope' && initial.capabilities.execution ? undefined : 'Trajectory binding or host-managed boundary; scope synchronization not exercised');
-  for (const [name, fixture, length] of [['no-action', options.noActionFixture, 0], ['forced-action', options.forcedActionFixture, 1]] as const) {
+  for (const [name, fixture, length] of [['no-action', options.noActionFixture, 0], ['single-candidate', options.singleCandidateFixture, 1]] as const) {
     await run(name, async () => { const { domain, observation } = await fixture!(); check((await domain.candidates(observation)).length === length, `Expected ${length} candidates`); }, fixture ? undefined : 'Scenario fixture not supplied; this edge case remains unverified');
   }
   return { passed: checks.every(item => item.status !== 'failed'), domainId: initial.id, checks };

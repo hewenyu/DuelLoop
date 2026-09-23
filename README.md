@@ -6,7 +6,7 @@ DuelLoop 的目标是成为面向对抗博弈的开发者框架：开发者安�
 
 框架以可执行策略连接两个循环：Jev 根据当前策略与实时局面决定动作，pi 驱动单模型或可配置研究团队提出策略更新，经独立验证后用于后续决策。
 
-当前实现为 `0.1.0` 开发版本，包含 TypeScript SDK、CLI、SQLite 存储、单模型/团队研究、Jev/pi 集成，以及 Kuhn Poker 和持续竞价两个模拟领域。真实服务需要使用者自己的模型凭据；离线演示明确使用 fixture，不证明真实模型的策略效果。已完成真实 Jev/pi 的受控策略更新、独立验证、激活和后续决策检查；正常基线的单模型与团队研究均返回 `no_change`。可直接使用的能力、实验限制与脱敏验证结果见[能力范围](docs/validation.md)，详细实现见[实施记录](docs/implementation.md)。
+当前实现为 `0.1.0` 开发版本，包含 TypeScript SDK、CLI、SQLite 存储、单模型/团队研究、Jev/pi 集成，以及 Kuhn Poker 和持续竞价两个模拟领域。真实服务需要使用者自己的模型凭据；离线演示明确使用 fixture，不证明真实模型的策略效果。当前行为为“模型决策，失败停止”：包括单候选在内，每次动作均调用模型；合法低置信度回答正常消费，模型失败不执行替代动作。此前真实 Jev/pi 闭环和 `no_change` 结果属于旧运行语义，不能作为本轮真实模型验收。可直接使用的能力、实验限制与脱敏验证结果见[能力范围](docs/validation.md)，详细实现见[实施记录](docs/implementation.md)。
 
 ## 开始运行
 
@@ -50,9 +50,9 @@ npm --prefix demo run check
 - [SDK 使用](docs/sdk.md)：托管快循环、嵌入已有 bot、宿主执行、反馈和事件。
 - [领域接入](docs/domains.md)：有限合法候选、可见状态、能力声明、合规测试和独立评价。
 - [CLI 与配置](docs/cli.md)：模型/角色配置、两个 worker、策略检查、研究、激活、回退及诊断。
-- [模型与实验](docs/models.md)：真实 Jev/pi、M0 三路径实验、端到端基准和真实闭环验收。
+- [模型与实验](docs/models.md)：真实 Jev/pi、M0 两条模型路径实验、端到端基准和真实闭环验收。
 - [运行维护](docs/operations.md)：停止、未知回执、备份恢复、资格失效、数据清理和兼容约束。
-- [架构实施基线](docs/design.md)与[验收记录](docs/implementation.md)：v0.3 目标、I-01—I-05 和 R1—R10。
+- [模型决策与停止契约](docs/model-only-decisions.md)、[架构实施基线](docs/design.md)与[验收记录](docs/implementation.md)：v0.3 目标、I-01—I-05 和 R1—R10。
 
 `npm test` 运行无密钥测试；`npm run test:live` 在未显式启用真实模型时报告跳过。`npm run benchmark` 只测 fixture 下的本地 SDK 与存储开销。真实服务、策略收益和真实并发性能必须单独实测，不能由离线通过推断。
 

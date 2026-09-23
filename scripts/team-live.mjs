@@ -18,7 +18,7 @@ async function main() {
  const check=args.includes('--check');
  const researchMode=process.env.DUELLOOP_LIVE_RESEARCH_MODE??'team';
  if(!['single','team'].includes(researchMode))throw Error('DUELLOOP_LIVE_RESEARCH_MODE must be single or team');
- const comparisonPlan={id:'normal-baseline-single-team-v1',modes:['single','team'],baseline:'createKuhnStrategy default confidence .55',developmentSeeds:[131,137],finalHoldouts:{single:{id:'normal-single-independent-holdout-v1',seeds:[3203,3209,3217,3221]},team:{id:'normal-team-independent-holdout-v1',seeds:[2203,2213,2221,2237]}},maxFinalUsesPerMode:1,interpretation:'Two predeclared experiments with separate holdouts; one run per mode supports descriptive outcome/cost comparison only, not a statistical claim that a research mode is superior.'};
+ const comparisonPlan={id:'normal-baseline-single-team-v1',modes:['single','team'],baseline:'createKuhnStrategy schema 2.0; model decisions only',developmentSeeds:[131,137],finalHoldouts:{single:{id:'normal-single-independent-holdout-v1',seeds:[3203,3209,3217,3221]},team:{id:'normal-team-independent-holdout-v1',seeds:[2203,2213,2221,2237]}},maxFinalUsesPerMode:1,interpretation:'Two predeclared experiments with separate holdouts; one run per mode supports descriptive outcome/cost comparison only, not a statistical claim that a research mode is superior.'};
  const holdout=comparisonPlan.finalHoldouts[researchMode];
  if(!check&&process.env.DUELLOOP_TEAM_LIVE!=='1')throw Error('Real team experiment requires explicit DUELLOOP_TEAM_LIVE=1 and DUELLOOP_LIVE=1');
  const source=configuredModel(check);
@@ -59,10 +59,10 @@ async function main() {
  }};
  const baseline=createKuhnStrategy();
  // This is the ordinary illustrative baseline, not the deliberately reversed R2 capability fixture.
- const protocol={version:'1.0',id:`normal-${researchMode}-final-v1`,domainId:domain.id,seeds:holdout.seeds,opponentIds:['calling','tight','random'],trajectoriesPerSeed:2,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},minSamples:4,minimumImprovement:.01,maxGroupRegression:.5,confidenceLevel:.95,maxFallbackRate:.2,maxP95LatencyMs:configuration.decisionMs,maxDevelopmentEvalRuns:1,maxFinalEvaluationsPerRun:1,holdoutId:holdout.id,maxHoldoutUses:1};
+ const protocol={version:'2.0',id:`normal-${researchMode}-final-v1`,domainId:domain.id,seeds:holdout.seeds,opponentIds:['calling','tight','random'],trajectoriesPerSeed:2,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},minSamples:4,minimumImprovement:.01,maxGroupRegression:.5,confidenceLevel:.95,maxP95LatencyMs:configuration.decisionMs,maxDevelopmentEvalRuns:1,maxFinalEvaluationsPerRun:1,holdoutId:holdout.id,maxHoldoutUses:1};
  const developmentProtocol={...protocol,id:'normal-shared-development-v1',seeds:[131,137],opponentIds:['calling','tight'],minSamples:2,holdoutId:'normal-shared-development-only-v1'};
- const summary={schemaVersion:'1.0',experiment:researchMode==='team'?'same-model-three-isolated-team-roles':'single-model-shared-session-three-phases',status:'started',mode:check?'offline_interface_check':'real_research_experiment',researchMode,comparisonPlan,comparisonPlanDigest:digest(comparisonPlan),decisionModelKind:model.kind,researchProviderKind:provider.kind,models:{decision:model.id,research:provider.id},configuration,
-  initialStrategyDigest:digest(baseline),initialConfidenceThreshold:baseline.decision.minRequiredConfidence,
+ const summary={schemaVersion:'2.0',experiment:researchMode==='team'?'same-model-three-isolated-team-roles':'single-model-shared-session-three-phases',status:'started',mode:check?'offline_interface_check':'real_research_experiment',researchMode,comparisonPlan,comparisonPlanDigest:digest(comparisonPlan),decisionModelKind:model.kind,researchProviderKind:provider.kind,models:{decision:model.id,research:provider.id},configuration,
+  initialStrategyDigest:digest(baseline),
   evaluationScale:{development:{independentSeeds:2,opponents:2,handsPerBlock:2,strategyArms:2,maxRuns:1,maxDecisionCalls:32},final:{independentSeeds:4,opponents:3,handsPerBlock:2,strategyArms:2,maxRuns:1,maxDecisionCalls:96},experienceSteps:12,maximumPlannedDecisionCalls:140},
   protocolDigest:digest(protocol),developmentProtocolDigest:digest(developmentProtocol),roleRuns,outputDirectory:output,database:root?join(root,`${researchMode}-evidence.sqlite`):':memory:',activation:'candidate_only'};
  let writeQueue=Promise.resolve();

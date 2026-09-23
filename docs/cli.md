@@ -13,7 +13,7 @@ duelloop status --config ./my-app/duelloop.json
 ```
 <!-- duelloop-check:offline-cli:end -->
 
-`init` 也支持 `--domain auction`。它生成 `duelloop.json`、`strategy.json`、`development.json`、`final.json`，不调用模型、不创建数据库、不覆盖现有文件。示例中的阈值、实验规模与资源预算用于演示，不能视为领域最佳参数。
+`init` 也支持 `--domain auction`。它生成 `duelloop.json`、`strategy.json`、`development.json`、`final.json`，不调用模型、不创建数据库、不覆盖现有文件。示例中的条件阈值、实验规模与资源预算用于演示，不能视为领域最佳参数。
 
 初始化默认使用明确标记为 `fixture` 的本地确定性评分器，研究关闭。首次 `run` 或 `step` 仅在空作用域安装初始策略；之后修改 `strategy.json` 不会悄悄替换已激活策略。快循环在每个实际决策后检查候选的激活边界。自动发布、显式发布与仅候选模式由 `activationMode` 规定。
 
@@ -86,7 +86,7 @@ node --env-file=.env dist/cli.js run --config ./jev-app/duelloop.json --steps 4
 }
 ```
 
-工厂接收 `{ applicationId, scopeId, options }`，返回 `{ domain, evaluator? }`。实现示例在 `templates/domain.mjs`，仅依赖公开 `duelloop` SDK。需要研究或评价时必须提供 `EvaluationAdapter`，并确保评价中的特征构建、基线和运行时间预算与生产决策一致。
+工厂接收 `{ applicationId, scopeId, options }`，返回 `{ domain, evaluator? }`。实现示例在 `templates/domain.mjs`，仅依赖公开 `duelloop` SDK。需要研究或评价时必须提供 `EvaluationAdapter`，并确保评价中的特征构建、知识更新和运行时间预算与生产决策一致。
 
 外部模块属于可信应用代码，运行相关命令会加载并执行它。`doctor` 只检查模块文件存在与 JSON 配置，不执行工厂；需要真实领域行为验证时使用公共 `runDomainConformance`，且只能针对可重置的测试环境。静态 doctor 通过不代表领域接入、模型质量或合规测试已通过。
 
@@ -159,7 +159,7 @@ duelloop research-worker --config ./my-app/duelloop.json
 | `run` | 可选 `--steps N`；运行有界快循环 |
 | `step` | 可选 `--stream ID`；一个已配置流的一次决策 |
 | `status` | 当前发布、持久激活模式/暂停状态、候选阻塞原因、作用域研究任务和待处理执行；不调用模型 |
-| `explain` | `--decision ID_OR_DIGEST`；完整决策依据、来源、降级、模型用量与动作 |
+| `explain` | `--decision ID_OR_DIGEST`；完整决策依据、来源、停止原因、模型用量与动作 |
 | `strategy-validate` | 可选 `--file PATH`；使用领域契约编译策略 |
 | `strategy-diff` | `--before PATH --after PATH`；语义差异与所需检查类别 |
 | `research-create` | 可选 `--id ID`；创建冻结任务，要求已有基线 |
@@ -181,6 +181,8 @@ duelloop research-worker --config ./my-app/duelloop.json
 | `export` | 可选 `--output NEW_PATH`；导出当前作用域公开事件与决策，不导出私有保留集明细 |
 | `help` / `--help` | JSON 命令与选项清单 |
 | `version` / `--version` | JSON 包版本 |
+
+模型失败会使运行命令以错误退出，停止记录可通过 `explain` 查询；不会自动切换程序动作。修复原因并完成 `reconcile` 后，显式重新运行命令以创建新实例。配置 Schema 仍为 `1.0`；策略 Schema 和评价协议为 `2.0`。旧发布不能直接在运行时 `duelloop-runtime-3` 下继续使用，迁移要求见[运维说明](operations.md)。
 
 数据库备份和清理属于整个数据库的维护操作，导出与业务查询则限定当前作用域。清理不会删除仍被事件、任务、发布、轨迹或执行记录引用的产物。使用新协议/新基线前保留相关实验的审计证据。
 

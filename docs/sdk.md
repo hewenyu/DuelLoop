@@ -44,7 +44,7 @@ try {
 
 这是规则环境与 SDK 集成演示，夹具分数不证明模型表现。参考模拟器的牌局与执行核对状态在内存中，重建实例会生成新的会话命名空间，不能恢复之前进行中的牌局。长期应用的环境恢复要求见 [运维说明](operations.md)。
 
-`app.start({ streamIds, maxSteps, intervalMs, signal })` 运行有界或持续快循环。一次 `step()` 返回 `{ decision, receipt }`；`decisionSource` 为 `strategy`、`domain_baseline`、`forced_action` 或 `abstain`。动作为空时没有执行回执。`subscribe(listener)` 返回取消订阅函数；持久事件有独立 ID，消费者按 ID 去重。
+`app.start({ streamIds, maxSteps, intervalMs, signal })` 运行有界或持续快循环。成功的 `step()` 返回 `{ decision, receipt }`，决策来源为 `strategy`。模型失败或无合法候选时先保存 `decisionSource: "stopped"`、`stopReason` 和已知回答/用量，再抛出关联决策 ID 的错误；停止记录没有动作，也不会创建执行意图。单候选同样需要调用模型。`subscribe(listener)` 返回取消订阅函数；持久事件有独立 ID，消费者按 ID 去重。
 
 | 模式 | 行为 |
 | --- | --- |
@@ -71,25 +71,25 @@ if (decision.action) {
 await app.submitFeedback(feedbackEvents);
 ```
 
-`prepareHostExecution()` 只创建经核验且已持久化的命令，`recordHostReceipt()` 记录该意图的实际结果。宿主必须使用该命令和幂等键执行；未知结果应先核对，不能自行换键重发。影子模式不能准备执行，宿主模式不能调用框架的 `executeDecision()`。`DecisionRecord` 包含实际发布摘要、模型种类、输入、问题、回答、效用、动作概率及降级来源，可用于定位动作变化。
+`prepareHostExecution()` 只创建经核验且已持久化的命令，`recordHostReceipt()` 记录该意图的实际结果。宿主必须使用该命令和幂等键执行；未知结果应先核对，不能自行换键重发。影子模式不能准备执行，宿主模式不能调用框架的 `executeDecision()`。`DecisionRecord` 包含实际发布摘要、模型种类、输入、问题、回答、效用、动作概率及停止原因，可用于定位动作变化。
 
 ## 模型与策略
 
 真实 Jev 使用 `new JevDecisionModel({ model: '明确的模型版本', apiKeyEnv: 'TYPESAFE_API_KEY' })`。可选 `baseURL`、`timeoutMs` 用于应用指定的端点与客户端限制。实际请求还受 SDK 决策截止时间限制。不要把密钥写入策略、配置产物或事件。`FixtureDecisionModel` 与 `JevDecisionModel` 的 `kind` 分别为 `fixture`、`real`，报告保留这一区别。
 
-Jev 适配器对 Score / Choice 返回概率统一检查标签、有限值及 `[0,1]` 范围；概率和与 1 的偏差不超过 `0.01`（另计浮点运算误差）时，按实际总和归一化后交给运行时，超出则拒绝。模型原始 `score`、`confidence` 保持不变，也不改变策略的置信度门槛。决策记录中的回答概率因此是归一化值。
+Jev 适配器对 Score / Choice 返回概率统一检查标签、有限值及 `[0,1]` 范围；概率和与 1 的偏差不超过 `0.01`（另计浮点运算误差）时，按实际总和归一化后交给运行时，超出则拒绝。模型原始 `score`、`confidence` 保持不变。`confidence` 只检查类型及 `[0,1]` 范围；合法值包括 0，不决定是否接受回答。决策记录中的回答概率因此是归一化值。
 
 `compileStrategy(strategy, domain)` 验证策略并返回稳定摘要；`validateStrategy()`、`diffStrategies()`、`buildQuestions()`、`evaluateAnswers()` 也从根入口导出。当前策略语言仅消费逐候选 `Score`，每个维度包含 2—10 个具体等级、评分语义和权重。Jev 的 Choice 适配接口可用于对照实验，不属于当前可演化策略的执行公式。
 
 `evaluateAnswers()` 默认按当前时间检查局面是否过期，也可通过第六个参数 `evaluatedAt` 指定重放时钟。候选行为夹具固定使用观察的 `observedAt`，因此保存的案例不会仅因时间流逝改变检查结果；现场决策仍按实际截止时间处理。
 
-不要原地修改已发布对象来更新行为。候选应是新的完整 `StrategyPackage`，通过 `CandidateSubmission` 绑定研究快照、基线发布、假设、证据和行为断言。问题或输入投影变化时，旧回答夹具不能证明新问题的行为。`0.55` 是示例置信度阈值，需要用领域数据校准。
+不要原地修改已发布对象来更新行为。候选应是新的完整 `StrategyPackage`，通过 `CandidateSubmission` 绑定研究快照、基线发布、假设、证据和行为断言。问题或输入投影变化时，旧回答夹具不能证明新问题的行为。策略 Schema 为 `2.0`，拒绝旧版以及 `minRequiredConfidence`、`exitConditions`、`fallback` 字段。运行时失败处理不能由候选策略改成程序接管。
 
 ## 反馈与研究
 
 `submitFeedback(event | events)` 接收即时、延迟或修订反馈；不传参数则调用领域的 `feedback()`。`feedbackId` 在修订间保持稳定，`revision` 单调增加；`eventTime` 表示事实发生时间，`receivedAt` 表示系统收到该修订的时间。研究快照引用截止时刻可见的具体修订，后续修订不改变已有快照。
 
-`ResearchOrchestrator` 接收 `store`、`domain`、`model`、`evaluator`、`dependencies` 与研究 `providers`。`dependencies` 使用实际应用的 `app.dependencies`，不要自行省略特征构建、基线、续打规则和运行时间预算。评价器必须声明实际执行的 `decisionPolicy`；内置评价器接受与应用一致的 `{ maxDecisionMs, executionReserveMs, randomSeed? }` 构造参数。公开 SDK 会在模型调用前拒绝不匹配的评价预算或采样种子。`create({ scopeId, protocol, developmentProtocol })` 在开始前冻结最终评价协议；开发与保留评价必须采用不同种子与不同 `holdoutId`。
+`ResearchOrchestrator` 接收 `store`、`domain`、`model`、`evaluator`、`dependencies` 与研究 `providers`。`dependencies` 使用实际应用的 `app.dependencies`，不要自行省略特征构建、知识更新、续打规则和运行时间预算。评价器必须声明实际执行的 `decisionPolicy`；内置评价器接受与应用一致的 `{ maxDecisionMs, executionReserveMs, randomSeed? }` 构造参数。公开 SDK 会在模型调用前拒绝不匹配的评价预算或采样种子。`create({ scopeId, protocol, developmentProtocol })` 在开始前冻结最终评价协议；开发与保留评价必须采用不同种子与不同 `holdoutId`。
 
 ```js
 const provider = new PiResearchProvider({ provider: '应用选择的provider', model: '明确的模型ID', apiKeyEnv: 'RESEARCH_API_KEY', maxTurns: 12 });
@@ -107,7 +107,7 @@ if (result.releaseDigest) await app.activate(result.releaseDigest);
 
 研究工具 `query_experience` 默认返回 5 条摘要，可按种类和偏移分页（每页最多 20 条），也可用 `evidenceRef` 读取完整冻结记录或指定字段。分页不会改变研究快照，引用其他快照中的记录会被拒绝。这样模型可以逐步查阅观察、合法动作、回答和反馈修订，避免每次加载全部历史。
 
-自定义评价器同时声明 `decisionPolicy` 和 `domainDependencies`。后者是实际实验领域的规则、特征构建、知识更新、降级基线、参考续打版本及上下文摘要；它们必须与 `app.dependencies` 对应部分完全一致。应用修改领域基线或上下文后，默认内置评价器不能继续为它生成验证结论。
+自定义评价器同时声明 `decisionPolicy` 和 `domainDependencies`。后者是实际实验领域的规则、特征构建、知识更新、参考续打版本及上下文摘要；它们必须与 `app.dependencies` 对应部分完全一致。应用修改特征构建或上下文后，默认内置评价器不能继续为它生成验证结论。
 
 `run()` 可返回 `no_change`、`completed_failed`、`completed_inconclusive`、预算耗尽或取消。只有通过最终验证才登记研究发布，登记不等于激活。最终失败结束该轮，不会无限反复优化同一保留集。`app.activate()` 还会核对基线摘要、依赖、激活模式和领域边界。
 
@@ -117,9 +117,13 @@ if (result.releaseDigest) await app.activate(result.releaseDigest);
 | --- | --- | --- |
 | npm SDK | `0.1.0` 开发版，ESM，Node.js 24 | 当前 API 仍可能调整；V1.0 后遵循 SemVer |
 | 应用配置 | `schemaVersion: "1.0"` | 拒绝未知版本、字段和非法组合 |
-| 策略 | `schemaVersion: "1.0"`，Score | 拒绝新语义、未知领域特征和不匹配的契约版本 |
-| 评价协议 | `version: "1.0"` | 创建研究前校验并固定摘要，不能事后换门槛 |
+| 策略 | `schemaVersion: "2.0"`，Score | 拒绝新语义、未知领域特征和不匹配的契约版本 |
+| 评价协议 | `version: "2.0"` | 创建研究前校验并固定摘要，不能事后换门槛 |
 | SQLite | `user_version = 1` | 空库初始化；未知较新版本拒绝；恢复仅接受完整 Schema 1 备份 |
-| 领域、模型及运行器 | 发布绑定中的完整行为依赖 | 依赖改变拒绝沿用既有验证，需重新评价 |
+| 领域、模型及运行器 | `duelloop-runtime-3` 与发布绑定中的完整行为依赖 | 依赖改变拒绝沿用既有验证，需重新评价 |
+
+失败停止后，当前实例不再接收新决策；再次调用 `start()` 不能清除该失败。先修复模型或输入问题，核对已有外部执行，关闭旧实例，再显式创建新的 `DuelLoop`。停止不撤销已经发出的动作，见[恢复流程](operations.md)。
+
+评价协议 `2.0` 删除 `maxFallbackRate`；`Episode` 和报告不再包含 `fallbacks`、`fallbackRate`。候选与对照策略都使用模型，任一模型失败使实验中断，不能用部分成功样本宣告通过。
 
 升级前保留备份，核对变更记录及上述契约，使用新安装包执行本领域回归和 `check:package`。影响决策行为的运行器修改必须更新 `RUNTIME_VERSION`；仅保持策略 JSON 不变不能说明升级兼容。开发工作区的未提交构建记录额外保存源文件清单与 tarball 摘要，不当作可互换的正式发布。

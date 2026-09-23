@@ -13,7 +13,6 @@ const piKeyEnv=process.env.DUELLOOP_PI_KEY_ENV;
 const enabled=process.env.DUELLOOP_LIVE==='1' && process.env.DUELLOOP_LIVE_CLOSED_LOOP==='1';
 const configured=process.env[keyEnv] && process.env.DUELLOOP_JEV_MODEL && process.env.DUELLOOP_PI_PROVIDER && process.env.DUELLOOP_PI_MODEL && piKeyEnv && process.env[piKeyEnv];
 function positiveEnv(name,fallback) {const n=Number(process.env[name]??fallback);assert.ok(Number.isSafeInteger(n)&&n>0,`${name} must be a positive integer`);return n;}
-function unitEnv(name,fallback) {const n=Number(process.env[name]??fallback);assert.ok(Number.isFinite(n)&&n>=0&&n<=1,`${name} must be in [0, 1]`);return n;}
 function distributionsDiffer(left,right,tolerance=1e-9) {
  return [...new Set([...Object.keys(left),...Object.keys(right)])].some(action=>Math.abs((left[action]??0)-(right[action]??0))>tolerance);
 }
@@ -39,7 +38,6 @@ test('LIVE R2: autonomous pi proposal → independent real-Jev evaluation → re
  const maxTokens=positiveEnv('DUELLOOP_LIVE_MAX_TOKENS',600000);
  const handsPerSeed=positiveEnv('DUELLOOP_LIVE_HANDS_PER_SEED',8);
  const maxDecisionMs=decisionMs;
- const initialMinRequiredConfidence=unitEnv('DUELLOOP_LIVE_MIN_CONFIDENCE',.55);
  const rawModel=new JevDecisionModel({model:process.env.DUELLOOP_JEV_MODEL,apiKeyEnv:keyEnv,baseURL:process.env.DUELLOOP_JEV_BASE_URL,timeoutMs:maxDecisionMs});
  let decisionCalls=0;
  const model={id:rawModel.id,kind:'real',score:async input=>{
@@ -56,9 +54,8 @@ test('LIVE R2: autonomous pi proposal → independent real-Jev evaluation → re
  // Deliberately defective initial utility, not a hand-written candidate. No correction is supplied to pi.
  // The passive condition uses a separate scope in the SAME database and shares the final holdout quota.
  const baseline=createKuhnStrategy();baseline.decision.defaultWeights=initialPolicyKind==='passive'?{gain:0,exposure:0}:{gain:-1,exposure:.8};baseline.version=initialPolicyKind==='passive'?'controlled-passive-v1':'controlled-v1';
- baseline.decision.minRequiredConfidence=initialMinRequiredConfidence;
  baseline.provenance.hypothesis='Controlled capability experiment initial policy, not a production baseline';
- const summary={schemaVersion:'1.1',experiment:'real-autonomous-closed-loop',status:'started',R2:'not_demonstrated',decisionModelKind:'real',researchProviderKind:'real',environment:'Kuhn Poker simulation',models:{decision:model.id,research:provider.id},artifactsDirectory:output,initialPolicyKind,scopeId,initialMinRequiredConfidence,
+ const summary={schemaVersion:'2.0',experiment:'real-autonomous-closed-loop',status:'started',R2:'not_demonstrated',decisionModelKind:'real',researchProviderKind:'real',environment:'Kuhn Poker simulation',models:{decision:model.id,research:provider.id},artifactsDirectory:output,initialPolicyKind,scopeId,
   budgets:{experienceSteps,postSteps,maxDecisionMs,maxDecisionCalls,maxTokens,researchSeconds,testTimeoutSeconds:positiveEnv('DUELLOOP_LIVE_TIMEOUT_SECONDS',defaultTimeoutSeconds),oldQuestionComparisonsShareDecisionCallBudget:true},evaluationScale:{handsPerSeed,developmentSeeds:3,developmentOpponents:2,finalSeeds:6,finalOpponents:3,maxDevelopmentEvaluations:2,maxFinalEvaluations:1}};
  let writeQueue=Promise.resolve();
  const save=()=>{const content=JSON.stringify(summary,null,2)+'\n';writeQueue=writeQueue.then(()=>writeFile(join(output,'result.json'),content,{mode:0o600}));return writeQueue;};
@@ -86,11 +83,11 @@ test('LIVE R2: autonomous pi proposal → independent real-Jev evaluation → re
    assert.equal(receipt?.status,'completed','Evidence collection must execute and settle real simulated actions');
   }
   assert.ok(before.some(d=>d.decisionSource==='strategy'&&d.modelKind==='real'),'No real Jev decisions available for research');
-  const protocol={version:'1.0',id:initialPolicyKind==='passive'?'controlled-passive-final-v1':'controlled-final-v1',domainId:domain.id,
+  const protocol={version:'2.0',id:initialPolicyKind==='passive'?'controlled-passive-final-v1':'controlled-final-v1',domainId:domain.id,
    seeds:[1009,2003,3001,4001,5003,6007],opponentIds:['calling','tight','random'],
    trajectoriesPerSeed:handsPerSeed,
    knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},
-   minSamples:6,minimumImprovement:0,maxGroupRegression:.5,confidenceLevel:.95,maxFallbackRate:.2,maxP95LatencyMs:maxDecisionMs,
+   minSamples:6,minimumImprovement:0,maxGroupRegression:.5,confidenceLevel:.95,maxP95LatencyMs:maxDecisionMs,
    maxDevelopmentEvalRuns:2,maxFinalEvaluationsPerRun:1,holdoutId:'controlled-independent-holdout-v1',maxHoldoutUses:1};
   const developmentProtocol={...protocol,id:initialPolicyKind==='passive'?'controlled-passive-development-v1':'controlled-development-v1',seeds:[31,73,113],minSamples:3,opponentIds:['calling','tight'],holdoutId:'controlled-development-only'};
   orchestrator=new ResearchOrchestrator({store,domain,model,evaluator:new KuhnEvaluationAdapter({maxDecisionMs,executionReserveMs:100,randomSeed:'r2-controlled-v1'}),dependencies:runtime.dependencies,providers:{researcher:abortableProvider},mode:'single',maxRounds:2,budget:{maxWallTimeSeconds:researchSeconds,maxTokensTotal:maxTokens,maxModelCalls:8,maxDecisionModelCalls:maxDecisionCalls,maxRepairAttempts:1}});

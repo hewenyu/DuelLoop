@@ -42,12 +42,12 @@ function measuredModel(options,role,store,scopeId) {
 }
 function fastSummary(samples,startedAt,endedAt) {
  const count=samples.length;
- return {measuredSteps:count,startedAt,endedAt,elapsedMs:endedAt-startedAt,
-  stepsPerSecond:endedAt>startedAt?count/((endedAt-startedAt)/1000):0,
+ const completed=samples.filter(s=>s.decisionSource==='strategy').length;
+ return {measuredSteps:count,completedSteps:completed,startedAt,endedAt,elapsedMs:endedAt-startedAt,
+  stepsPerSecond:endedAt>startedAt?completed/((endedAt-startedAt)/1000):0,
   latencyMs:quantiles(samples.map(s=>s.latencyMs)),
-  timeoutRate:count?samples.filter(s=>s.fallbackReason==='MODEL_TIMEOUT').length/count:null,
-  fallbackRate:count?samples.filter(s=>s.decisionSource==='domain_baseline').length/count:null,
-  abstentionRate:count?samples.filter(s=>s.decisionSource==='abstain').length/count:null,
+  timeoutRate:count?samples.filter(s=>s.stopReason==='MODEL_TIMEOUT').length/count:null,
+  stoppedRate:count?samples.filter(s=>s.decisionSource==='stopped').length/count:null,
   unknownReceiptCount:samples.filter(s=>s.receiptStatus==='unknown').length};
 }
 async function workerMain() {
@@ -68,9 +68,9 @@ async function workerMain() {
     const begin=now();
     try {
      const {decision,receipt}=await runtime.step('fast-stream');
-     samples.push({startedAt:begin,endedAt:now(),latencyMs:now()-begin,decisionSource:decision.decisionSource,fallbackReason:decision.fallbackReason??null,receiptStatus:receipt?.status??null});
+     samples.push({startedAt:begin,endedAt:now(),latencyMs:now()-begin,decisionSource:decision.decisionSource,stopReason:decision.stopReason??null,receiptStatus:receipt?.status??null});
      if(receipt?.status==='unknown'){failureCode='EXECUTION_UNKNOWN';break;}
-    } catch(error){failureCode=error.code??'FAST_WORKER_ERROR';break;}
+    } catch(error){failureCode=error.code??'FAST_WORKER_ERROR';samples.push({startedAt:begin,endedAt:now(),latencyMs:now()-begin,decisionSource:'stopped',stopReason:failureCode,receiptStatus:null});break;}
     if((index+1)%25===0)parentPort.postMessage({type:'progress',result:{...fastSummary(samples,startedAt,now()),modelCallsIncludingWarmup:measured.calls(),usageIncludingWarmup:measured.usage}});
    }
    const endedAt=now();Atomics.store(fastDone,0,1);
@@ -79,7 +79,7 @@ async function workerMain() {
   const adapter=new KuhnEvaluationAdapter(policy),baseReleaseDigest=store.activeRelease('benchmark');
   const baseline=store.getArtifact(store.release(baseReleaseDigest).strategyDigest),candidate=structuredClone(baseline);
   candidate.version='benchmark-candidate';candidate.parentVersion=baseline.version;candidate.decision.defaultWeights.exposure=-.4;
-  const protocol={version:'1.0',id:'concurrent-development-workload',domainId:domain.id,seeds:[101,103],opponentIds:['calling','tight'],trajectoriesPerSeed:options.slowHands,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},minSamples:2,minimumImprovement:0,maxGroupRegression:1,confidenceLevel:.95,maxFallbackRate:1,maxP95LatencyMs:options.timeoutMs,maxDevelopmentEvalRuns:options.slowRuns,maxFinalEvaluationsPerRun:1,holdoutId:'development-workload-not-release-evidence',maxHoldoutUses:1};
+  const protocol={version:'2.0',id:'concurrent-development-workload',domainId:domain.id,seeds:[101,103],opponentIds:['calling','tight'],trajectoriesPerSeed:options.slowHands,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},minSamples:2,minimumImprovement:0,maxGroupRegression:1,confidenceLevel:.95,maxP95LatencyMs:options.timeoutMs,maxDevelopmentEvalRuns:options.slowRuns,maxFinalEvaluationsPerRun:1,holdoutId:'development-workload-not-release-evidence',maxHoldoutUses:1};
   const startedAt=now(),experiments=[];let failureCode=null;
   for(let index=0;index<options.slowRuns&&!Atomics.load(fastDone,0);index++) {
    const begin=now();
@@ -146,7 +146,7 @@ async function main() {
    const phases={};
    for(const name of measurementOrder)phases[name]=await phase(options,join(directory,`${index}-${name}.sqlite`),name==='concurrent');
    const {standalone,concurrent}=phases;
-   const comparison={p50LatencyRatio:ratio(concurrent.fast?.latencyMs?.p50,standalone.fast?.latencyMs?.p50),p95LatencyRatio:ratio(concurrent.fast?.latencyMs?.p95,standalone.fast?.latencyMs?.p95),p99LatencyRatio:ratio(concurrent.fast?.latencyMs?.p99,standalone.fast?.latencyMs?.p99),throughputRatio:ratio(concurrent.fast?.stepsPerSecond,standalone.fast?.stepsPerSecond),timeoutRateDifference:difference(concurrent.fast?.timeoutRate,standalone.fast?.timeoutRate),fallbackRateDifference:difference(concurrent.fast?.fallbackRate,standalone.fast?.fallbackRate)};
+   const comparison={p50LatencyRatio:ratio(concurrent.fast?.latencyMs?.p50,standalone.fast?.latencyMs?.p50),p95LatencyRatio:ratio(concurrent.fast?.latencyMs?.p95,standalone.fast?.latencyMs?.p95),p99LatencyRatio:ratio(concurrent.fast?.latencyMs?.p99,standalone.fast?.latencyMs?.p99),throughputRatio:ratio(concurrent.fast?.stepsPerSecond,standalone.fast?.stepsPerSecond),timeoutRateDifference:difference(concurrent.fast?.timeoutRate,standalone.fast?.timeoutRate),stoppedRateDifference:difference(concurrent.fast?.stoppedRate,standalone.fast?.stoppedRate)};
    const complete=standalone.status==='completed'&&concurrent.status==='completed'&&concurrent.concurrentFastSteps>0;
    repetitions.push({index,measurementOrder,status:complete?'completed':'incomplete',standalone,concurrent,comparison});
   }
@@ -156,12 +156,12 @@ async function main() {
   };
   const status=repetitions.every(r=>r.status==='completed')?'completed':'incomplete';
   const primary=repetitions[0];
-  const report={schemaVersion:'1.1',experiment:'fast-worker-versus-concurrent-evaluation-shared-sqlite',status,modelKind:model.kind,model:model.id,
+  const report={schemaVersion:'2.0',experiment:'fast-worker-versus-concurrent-evaluation-shared-sqlite',status,modelKind:model.kind,model:model.id,
    startedAt,machine:{node:process.version,platform:process.platform,osRelease:release(),arch:process.arch,cpuModel:cpus()[0]?.model??'unknown',logicalCpus:cpus().length,availableParallelism:availableParallelism(),memoryBytes:totalmem(),freeMemoryBytesAtReport:freemem()},
    configuration:{...options,output:options.output??null,fastSeed:11,fastOpponent:'calling',evaluationSeeds:[101,103],evaluationOpponents:['calling','tight'],knowledgeStateMode:'frozen',initialKnowledge:{},strategyDigest:digest(createKuhnStrategy()),storage:'Two independent SQLite connections to one on-disk WAL database per phase. Every phase of every repetition uses a separate freshly initialized database.',concurrency:'Standalone: one fast worker thread. Concurrent: one fast and one slow evaluation worker thread, same process and SQLite file. No pi research conversation.',measurementOrder:'Alternating by repetition: standalone/concurrent, then concurrent/standalone.',totalBudgetUpperBounds:{fastModelCalls:2*options.repetitions*options.maxFastCalls,slowModelCalls:options.repetitions*options.maxSlowCalls,slowExperiments:options.repetitions*options.slowRuns,measuredPhaseWallSeconds:2*options.repetitions*options.wallSeconds,wallTimeNote:'Sum of phase timeout budgets; excludes setup, initialization, reporting and worker termination overhead.'},stopRule:'Slow worker finishes its in-progress experiment then stops when fast worker ends, or earlier at its declared call/experiment/wall-time cap.'},
    claim:options.fixture?'Local fixture CPU/storage contention and SDK end-to-end overhead only. No paid network calls; these numbers are not Jev or pi service latency and are not a scaling guarantee.':'Descriptive real-model measurements for this machine, database and workload. Provider contention is included; no generalized throughput guarantee.',
    primaryRepetition:0,primaryFieldsNote:'Top-level standalone/concurrent/comparison retain repetition zero for compatibility; they are not aggregate statistics.',standalone:primary.standalone,concurrent:primary.concurrent,comparison:primary.comparison,
-   repetitions,descriptiveSummary:{interpretation:'Observed minimum, maximum and arithmetic mean across completed repetitions. These ranges are descriptive variability, not statistical confidence intervals. One repetition cannot estimate repeat variability.',completedRepetitions:repetitions.filter(r=>r.status==='completed').length,p50LatencyRatio:describe('p50LatencyRatio'),p95LatencyRatio:describe('p95LatencyRatio'),p99LatencyRatio:describe('p99LatencyRatio'),throughputRatio:describe('throughputRatio'),timeoutRateDifference:describe('timeoutRateDifference'),fallbackRateDifference:describe('fallbackRateDifference')}};
+   repetitions,descriptiveSummary:{interpretation:'Observed minimum, maximum and arithmetic mean across completed repetitions. These ranges are descriptive variability, not statistical confidence intervals. One repetition cannot estimate repeat variability.',completedRepetitions:repetitions.filter(r=>r.status==='completed').length,p50LatencyRatio:describe('p50LatencyRatio'),p95LatencyRatio:describe('p95LatencyRatio'),p99LatencyRatio:describe('p99LatencyRatio'),throughputRatio:describe('throughputRatio'),timeoutRateDifference:describe('timeoutRateDifference'),stoppedRateDifference:describe('stoppedRateDifference')}};
   await emitReport(report,options.output);if(status!=='completed')process.exitCode=1;
  } finally {await rm(directory,{recursive:true,force:true});}
 }

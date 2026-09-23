@@ -4,7 +4,7 @@ DuelLoop 的快循环通过 `DecisionModel` 接口使用 Jev Score，慢循环�
 
 当前锁定依赖是 `@typesafe-ai/sdk@0.6.0`、`@earendil-works/pi-coding-agent@0.87.0` 和 `@earendil-works/pi-ai@0.87.0`。安装后的实际模型清单取决于该 pi 版本内置目录；不在目录中的模型会明确报错，不自动换成其他模型。框架不会把传输成功解释为该模型适合你的领域。
 
-当前已通过官方端点实测 `jev-1.13.0` 的 Score / Choice 传输，以及 pi 调用 DeepSeek `deepseek-flash` 的受控工具会话。DeepSeek 使用 `provider: 'deepseek'`，由当前 pi 目录选择官方端点和协议；该目录中的模型 ID 不是 `deepseek-chat` 或 `deepseek-reasoner`。这些接入结果不代表自主闭环验收已通过，也不证明策略收益。
+2026-09-22 的旧语义版本已通过官方端点实测 `jev-1.13.0` 的 Score / Choice 传输，以及 pi 调用 DeepSeek `deepseek-flash` 的受控工具会话。DeepSeek 使用 `provider: 'deepseek'`，由当前 pi 目录选择官方端点和协议；该目录中的模型 ID 不是 `deepseek-chat` 或 `deepseek-reasoner`。这些历史接入结果不代表本轮“模型失败停止”语义已通过真实服务验收，也不证明策略收益。本轮未重新调用收费模型。
 
 ## 凭据与模型配置
 
@@ -33,11 +33,11 @@ const researchProvider = new PiResearchProvider({
 
 `JevDecisionModel` 的 `baseURL`、`PiResearchProvider` 的 `baseURL` / `api` 可以显式覆盖已知提供方的接入地址及协议。覆盖端点不会放宽模型、回答及工具权限校验。不要向不可信地址发送密钥或领域状态。
 
-Jev 策略运行时只消费 Score：每个问题需要 2—10 个具体等级，分数可为期望值而非整数，归一化使用 `score / (levels - 1)`。低置信度、缺失回答和超时按策略及领域基线处理。`0.55` 是示例阈值，不是领域通用默认最优值。Jev `choice()` 仅用于 M0 对照；Noul 不在第一版策略执行语言中。
+Jev 策略运行时只消费 Score：每个问题需要 2—10 个具体等级，分数可为期望值而非整数，归一化使用 `score / (levels - 1)`。合法低置信度回答正常消费，包括 confidence 为 0；缺失、非法回答、模型超时或不可达会停止运行，不生成替代动作。单候选仍调用模型。Jev `choice()` 仅用于 M0 对照；Noul 不在第一版策略执行语言中。
 
-Score / Choice 的概率字段先校验标签和有限的 `[0,1]` 值。概率和与 1 的偏差在原有 `0.01` 容差内（另计浮点运算误差）时，适配器按实际总和归一化；超出容差则拒绝。真实开发回答中出现过概率和为 `0.99` 的分布，离线回归覆盖了该情形。归一化不修改模型返回的 `score`、`confidence`，也不放宽策略门槛；决策记录保留的是归一化概率。
+Score / Choice 的概率字段先校验标签和有限的 `[0,1]` 值。概率和与 1 的偏差在原有 `0.01` 容差内（另计浮点运算误差）时，适配器按实际总和归一化；超出容差则拒绝。真实开发回答中出现过概率和为 `0.99` 的分布，离线回归覆盖了该情形。归一化不修改模型返回的 `score`、`confidence`，不设置置信度接受门槛；决策记录保留的是归一化概率。
 
-请求中的模型 ID 必须与返回的实际 ID 一致，否则框架拒绝沿用原行为依赖。请选用服务实际返回的可固定版本 ID；使用随服务更新的别名可能触发不兼容诊断。升级模型、问题语义、特征、基线、参考续打策略或执行时间预算后，应重新评价。
+请求中的模型 ID 必须与返回的实际 ID 一致，否则框架拒绝沿用原行为依赖。请选用服务实际返回的可固定版本 ID；使用随服务更新的别名可能触发不兼容诊断。升级模型、问题语义、特征、知识更新、参考续打策略或执行时间预算后，应重新评价。
 
 pi 会话只启用当前研究任务的受控工具：经验、基线与规则、开发历史、开发实验、行为夹具登记以及候选提交。单模型复用一个会话；团队模式每个角色独立会话，即使三个角色配置了同一模型。SDK 明确关闭默认扩展、AGENTS、skills、提示模板及内建 bash/read/edit/write 发现；离线适配器测试会检验实际 SDK 的隔离行为。
 
@@ -80,7 +80,7 @@ DUELLOOP_LIVE=0 npm run test:live
 
 最后一条命令明确关闭付费请求，即使本地 `.env` 存在凭据也显示跳过，不能作为真实模型验收证据。fixture 报告的 `modelKind` 是 `fixture`；它们不证明 Jev 的延迟、牌力或 pi 的研究价值。
 
-M0 的三个路径为领域基线、Jev Choice 和 Jev 多维 Score。每个路径从同样的种子、对手设置和空知识快照创建独立环境；动作不同后环境可自然分歧。默认冻结跨轨迹知识。脚本记录收益、调用量、p50/p95/p99、吞吐、超时、降级及未知用量；原始分块数据保留用于复核。测得的收益仅适用于指定对手和条件，不属于独立保留集证明。
+M0 的两条路径为 Jev Choice 和 Jev 多维 Score，均调用显式配置的模型。每个路径从同样的种子、对手设置和空知识快照创建独立环境；动作不同后环境可自然分歧。默认冻结跨轨迹知识。脚本记录收益、调用量、p50/p95/p99、吞吐、超时、停止原因及未知用量；原始分块数据保留用于复核。任何模型失败都会结束当前实验，并将结果标为 `incomplete`；不能用部分完成的收益作为通过证据。测得的收益仅适用于指定对手和条件，不属于独立保留集证明。
 
 benchmark 通过公共 SDK 执行完整 `step()`，包含磁盘 SQLite WAL 的决策、意图和回执写入。它测顺序处理吞吐；默认用一个流，报告中的 warmup 调用也计入费用。fixture benchmark 的耗时只是本地运行时和存储开销，不能代替真实端到端延迟。
 
@@ -99,7 +99,7 @@ DUELLOOP_LIVE=1 node --env-file=.env scripts/benchmark.mjs --steps 100 --max-cal
 
 ## 真实 pi 自主闭环验收
 
-2026-09-22 已完成一次受控验收，详见[受控闭环验证摘要](validation.md)。该次使用 `jev-1.13.0`、`deepseek-v4-pro`、`passive` 初始策略、初始阈值 `0.10`、每块 8 手、研究预算 2,000,000 tokens 及每次 provider 最多 32 轮。模型自主改变权重、分支与阈值，独立验证通过并用于后续 20 次步骤。下列默认配置仅是有界实验起点，不保证每轮产生更新，也不保证较小预算能够完成同样任务。
+2026-09-22 在旧语义版本中完成一次受控验收，详见[受控闭环验证摘要](validation.md)。该次使用 `jev-1.13.0`、`deepseek-v4-pro`、`passive` 初始策略、初始阈值 `0.10`、每块 8 手、研究预算 2,000,000 tokens 及每次 provider 最多 32 轮。模型自主改变权重、分支与阈值，独立验证通过并用于后续 20 次步骤。这些记录如实保留，但包含已删除的阈值与降级路径，不能绑定到当前 Schema 2.0 / runtime 3；本轮真实闭环未重新执行。下列默认配置仅是有界实验起点，不保证每轮产生更新，也不保证较小预算能够完成同样任务。
 
 `test/live/models.test.mjs` 只是 Score、Choice 和受控 pi 工具的传输冒烟测试。完整闭环由 `test/live/closed-loop.test.mjs` 单独执行；它会产生更多付费模型调用，因此另需 `DUELLOOP_LIVE_CLOSED_LOOP=1`。
 
@@ -121,7 +121,6 @@ DUELLOOP_LIVE=1 DUELLOOP_LIVE_CLOSED_LOOP=1 node --env-file=.env --test test/liv
 | `DUELLOOP_LIVE_PI_MAX_TURNS` | 单次 pi provider 调用的轮次上限 |
 | `DUELLOOP_LIVE_RESEARCH_SECONDS` / `DUELLOOP_LIVE_TIMEOUT_SECONDS` | 研究和整个测试时限 |
 | `DUELLOOP_LIVE_DECISION_MS` | 单次实时及实验决策预算 |
-| `DUELLOOP_LIVE_MIN_CONFIDENCE` | 仅设置受控实验初始策略的置信度阈值，范围 `[0,1]`，默认 `0.55`；不是 SDK 全局默认值，也不放宽最终评价协议 |
 | `DUELLOOP_LIVE_EXPERIENCE_STEPS` / `DUELLOOP_LIVE_POST_STEPS` | 初始经验及激活后观察步数 |
 | `DUELLOOP_LIVE_HANDS_PER_SEED` | 每个实验块的手牌数 |
 | `DUELLOOP_LIVE_INITIAL_POLICY` | 受控初始缺陷：默认 `inverted_weights` 为逆向权重；`passive` 为全零动作效用，使用独立作用域。两种条件共用同一数据库中的最终保留集额度，不会重置已用额度 |
@@ -131,7 +130,7 @@ DUELLOOP_LIVE=1 DUELLOOP_LIVE_CLOSED_LOOP=1 node --env-file=.env --test test/liv
 
 初始缺陷的选择也是实验设计的一部分。逆向权重可能在部分对手上碰巧形成有效打法，研究没有验证出稳定改进时应保留该结论。全零效用条件用于检验更明确的决策缺陷；它依然只提供初始策略和经验，研究模型必须自主提出候选。更换条件不能绕过最终保留集的使用限制，也不能替代正常基线上的改进实验。
 
-`DUELLOOP_LIVE_MIN_CONFIDENCE` 应在本轮实验开始前确定，并记录在结果和初始策略中。它不修改正常示例策略，也不改变最终协议的最大降级率等要求；已有持久实验若初始策略摘要不同会被拒绝，不能借调整该值悄悄重置同一保留实验。
+`DUELLOOP_LIVE_MIN_CONFIDENCE` 已删除。当前候选不能通过降低阈值改变接管频率；每次动作均依赖完整合法的模型回答。已有持久实验若策略或行为依赖不同会拒绝沿用旧发布；升级不能重置同一保留集。新的真实验收需独立设计尚未使用的保留条件，不能直接反复运行旧保留种子。
 
 `no_change`、验证拒绝、证据不足和预算停止会如实写入产物并将 R2 标记为未证明；测试显示跳过，不能记为 R2 通过。仅当真实研究提出、独立验证、激活和后续动作变化都留下证据，才记录受控模拟环境中的 R2 能力。
 
@@ -147,9 +146,9 @@ DUELLOOP_LIVE=1 DUELLOOP_LIVE_CLOSED_LOOP=1 node --env-file=.env --test test/liv
 node scripts/concurrency-benchmark.mjs --fixture --repetitions 3 --steps 1000 --warmup 10 --slow-runs 100 --slow-hands 8 --wall-seconds 120 --output artifacts/concurrency-fixture.json
 ```
 
-报告列出机器、Node.js、模型模式、并发 worker 数量、实验规模，以及两阶段快循环的 p50/p95/p99、超时率、降级率、吞吐和模型用量。`concurrentFraction` 表示实际与实验重叠的快循环样本比例，`latencyWhileEvaluationActiveMs` 单列这些样本；实验先达到规模上限时，不把剩余独立快循环冒充并发样本。慢 worker 在快循环结束后完成当前实验即停止，也受 `--slow-runs`、`--max-slow-calls` 和 `--wall-seconds` 约束。
+报告列出机器、Node.js、模型模式、并发 worker 数量、实验规模，以及两阶段快循环的 p50/p95/p99、超时率、停止率、成功步骤吞吐和模型用量。`concurrentFraction` 表示实际与实验重叠的快循环样本比例，`latencyWhileEvaluationActiveMs` 单列这些样本；实验先达到规模上限时，不把剩余独立快循环冒充并发样本。慢 worker 在快循环结束后完成当前实验即停止，也受 `--slow-runs`、`--max-slow-calls` 和 `--wall-seconds` 约束。
 
-默认 `--repetitions 3`，也允许设为 1。每次重复的两个阶段都新建独立数据库；奇数次先测独立运行，偶数次先测并发运行，以减少固定测量顺序的影响。报告的 `repetitions` 保留每次比较，`descriptiveSummary` 给出完成重复中的 p95 时延比、吞吐比等指标的最小值、最大值和均值。这些范围表达观测到的重复波动，不是统计置信区间；单次结果没有重复波动的估计。Schema 1.1 顶层的 `standalone`、`concurrent` 和 `comparison` 仍指第一次重复，汇总必须读取 `descriptiveSummary`。
+默认 `--repetitions 3`，也允许设为 1。每次重复的两个阶段都新建独立数据库；奇数次先测独立运行，偶数次先测并发运行，以减少固定测量顺序的影响。报告的 `repetitions` 保留每次比较，`descriptiveSummary` 给出完成重复中的 p95 时延比、吞吐比等指标的最小值、最大值和均值。这些范围表达观测到的重复波动，不是统计置信区间；单次结果没有重复波动的估计。Schema 2.0 顶层的 `standalone`、`concurrent` 和 `comparison` 仍指第一次重复，汇总必须读取 `descriptiveSummary`。
 
 默认每阶段最多 1,200 次快循环调用（包含预热），慢 worker 每个并发阶段最多 10,000 次调用。所有预算按阶段计算：重复 R 次的快循环总调用上限为 `2 × R × max-fast-calls`，慢模型为 `R × max-slow-calls`，慢实验为 `R × slow-runs`，阶段墙钟预算之和为 `2 × R × wall-seconds`（不含初始化、报告和终止开销）。默认 3 次最多 7,200 次快调用与 30,000 次慢调用；这是上限，慢 worker 通常在快循环结束后提前停止。使用 `--steps` 增加规模时相应调整 `--max-fast-calls`，避免配置不足。`--timeout-ms` 同时绑定运行器及评价器的决策预算。脚本只执行开发评价工作负载，不运行 pi 研究对话，不登记或激活候选发布。
 
@@ -157,9 +156,9 @@ node scripts/concurrency-benchmark.mjs --fixture --repetitions 3 --steps 1000 --
 
 ## 正常基线的单模型与团队研究对照
 
-真实三阶段与会话隔离已验证，正常基线的两种模式均为 `no_change`；公开结论与比较限制见[验证摘要](validation.md)，原始用量及失败记录仅保存在本地。
+旧语义下的真实三阶段与会话隔离已验证，正常基线的两种模式均为 `no_change`；当前模型决策语义尚未重做真实实验。公开结论与比较限制见[验证摘要](validation.md)，原始用量及失败记录仅保存在本地。
 
-`scripts/team-live.mjs` 使用公共 SDK 和普通 `createKuhnStrategy()` 基线（示例置信度阈值 `0.55`），与故意设置缺陷的闭环能力验收分开。`single` 让同一个模型在一个会话内完成研究、对抗检查和整合；`team` 让同一个模型在三个隔离会话中承担这三个角色。运行前配置前文的 Jev、pi 模型与凭据；以下两次执行会产生付费请求：
+`scripts/team-live.mjs` 使用公共 SDK 和普通 `createKuhnStrategy()` 对照策略（Schema 2.0，无置信度接受门槛），与故意设置缺陷的闭环能力验收分开。`single` 让同一个模型在一个会话内完成研究、对抗检查和整合；`team` 让同一个模型在三个隔离会话中承担这三个角色。运行前配置前文的 Jev、pi 模型与凭据；以下两次执行会产生付费请求：
 
 ```sh
 DUELLOOP_LIVE=1 DUELLOOP_TEAM_LIVE=1 DUELLOOP_LIVE_RESEARCH_MODE=single node --env-file=.env scripts/team-live.mjs

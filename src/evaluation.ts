@@ -1,5 +1,6 @@
 import { invariant } from './errors.js';
 import { digest } from './utils.js';
+import { validateScoreAnswer, validateStrategy } from './strategy.js';
 import { decisionPolicyRuntimeVersion } from './runtime.js';
 import type { BehaviorDependencies, DecisionModel, EvaluationAdapter, EvaluationEpisode, EvaluationProtocol, Features, StrategyPackage, ValidationReport } from './types.js';
 
@@ -7,15 +8,16 @@ import type { BehaviorDependencies, DecisionModel, EvaluationAdapter, Evaluation
 export function validateProtocol(input: unknown): EvaluationProtocol {
   invariant(input && typeof input === 'object', 'CONFIG_INVALID', 'Evaluation protocol must be an object');
   const p = input as EvaluationProtocol;
-  invariant(p.version === '1.0' && typeof p.id === 'string' && !!p.id && typeof p.domainId === 'string' && !!p.domainId, 'CONFIG_INVALID', 'Invalid protocol identity');
+  invariant(p.version === '2.0' && typeof p.id === 'string' && !!p.id && typeof p.domainId === 'string' && !!p.domainId, 'CONFIG_INVALID', 'Invalid protocol identity');
   invariant(Array.isArray(p.seeds) && p.seeds.length > 0 && p.seeds.every(Number.isSafeInteger) && new Set(p.seeds).size === p.seeds.length, 'CONFIG_INVALID', 'Seeds must be distinct integers');
   invariant(Array.isArray(p.opponentIds) && p.opponentIds.length > 0 && p.opponentIds.every(x => typeof x === 'string' && !!x) && new Set(p.opponentIds).size === p.opponentIds.length, 'CONFIG_INVALID', 'Opponents must be distinct IDs');
   for (const key of ['trajectoriesPerSeed', 'minSamples', 'maxDevelopmentEvalRuns', 'maxFinalEvaluationsPerRun', 'maxHoldoutUses'] as const) invariant(Number.isSafeInteger(p[key]) && p[key] >= (key === 'maxDevelopmentEvalRuns' ? 0 : 1), 'CONFIG_INVALID', `Invalid ${key}`);
   invariant(p.minSamples >= 2 && p.maxFinalEvaluationsPerRun === 1, 'CONFIG_INVALID', 'At least two independent samples and exactly one final evaluation per run are required');
   invariant(['frozen', 'online_update'].includes(p.knowledgeStateMode) && p.initialKnowledge && typeof p.initialKnowledge === 'object' && !Array.isArray(p.initialKnowledge), 'CONFIG_INVALID', 'Invalid knowledge state');
   invariant(p.metric && ['maximize', 'minimize'].includes(p.metric.direction) && typeof p.metric.name === 'string' && !!p.metric.name && typeof p.metric.unit === 'string', 'CONFIG_INVALID', 'Invalid metric');
-  for (const key of ['minimumImprovement', 'maxGroupRegression', 'maxFallbackRate', 'maxP95LatencyMs'] as const) invariant(Number.isFinite(p[key]) && p[key] >= 0, 'CONFIG_INVALID', `Invalid ${key}`);
-  invariant(p.maxFallbackRate <= 1 && p.confidenceLevel > 0.5 && p.confidenceLevel < 1 && typeof p.holdoutId === 'string' && !!p.holdoutId, 'CONFIG_INVALID', 'Invalid confidence or holdout limits');
+  for (const key of ['minimumImprovement', 'maxGroupRegression', 'maxP95LatencyMs'] as const) invariant(Number.isFinite(p[key]) && p[key] >= 0, 'CONFIG_INVALID', `Invalid ${key}`);
+  invariant(p.confidenceLevel > 0.5 && p.confidenceLevel < 1 && typeof p.holdoutId === 'string' && !!p.holdoutId, 'CONFIG_INVALID', 'Invalid confidence or holdout limits');
+  invariant(!('maxFallbackRate' in p), 'CONFIG_INVALID', 'Fallback thresholds are not supported');
   digest(p);
   return structuredClone(p);
 }
@@ -25,9 +27,10 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 function validateEpisode(e: EvaluationEpisode): void {
+  invariant(e && !('fallbacks' in e), 'VALIDATION_REJECTED', 'Legacy fallback experiment results are not accepted');
   invariant(e && Number.isFinite(e.reward), 'VALIDATION_REJECTED', 'Episode reward must be finite and settled');
-  for (const key of ['decisions', 'fallbacks', 'modelCalls'] as const) invariant(Number.isSafeInteger(e[key]) && e[key] >= 0, 'VALIDATION_REJECTED', `Invalid episode ${key}`);
-  invariant(e.fallbacks <= e.decisions && Array.isArray(e.latenciesMs) && e.latenciesMs.length === e.decisions && e.latenciesMs.every(x => Number.isFinite(x) && x >= 0), 'VALIDATION_REJECTED', 'Episode latency/fallback data are incomplete');
+  for (const key of ['decisions', 'modelCalls'] as const) invariant(Number.isSafeInteger(e[key]) && e[key] >= 0, 'VALIDATION_REJECTED', `Invalid episode ${key}`);
+  invariant(Array.isArray(e.latenciesMs) && e.latenciesMs.length === e.decisions && e.latenciesMs.every(x => Number.isFinite(x) && x >= 0), 'VALIDATION_REJECTED', 'Episode latency data are incomplete');
 }
 // Student-t two-sided interval, evaluated numerically; no normal approximation for tiny samples.
 function logGamma(z: number): number {
@@ -89,6 +92,7 @@ export interface EvaluateCandidateOptions {
 /** Each seed is an independent paired block; actions within a block are never counted as samples. */
 export async function evaluateCandidate(options: EvaluateCandidateOptions): Promise<ValidationReport> {
   const { candidate, baseline, adapter, model, dependencies, baseReleaseDigest, stage } = options;
+  validateStrategy(candidate); validateStrategy(baseline);
   const protocol = validateProtocol(options.protocol);
   invariant(candidate.scope.domain === protocol.domainId && baseline.scope.domain === protocol.domainId, 'CONFIG_INVALID', 'Protocol and strategy domains differ');
   invariant(model.id === dependencies.model, 'VERSION_INCOMPATIBLE', 'Evaluation model does not match behavior dependencies');
@@ -97,13 +101,13 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
   invariant(decisionPolicyRuntimeVersion(adapter.decisionPolicy) === dependencies.runtime, 'VERSION_INCOMPATIBLE', 'Evaluation decision deadline, execution reserve or random seed differs from runtime binding');
   invariant(adapter.domainDependencies && typeof adapter.domainDependencies === 'object', 'VERSION_INCOMPATIBLE', 'Evaluation adapter must declare the domain behavior dependencies it actually simulates');
   const { model: _modelBinding, runtime: _runtimeBinding, ...domainBinding } = dependencies;
-  invariant(digest(adapter.domainDependencies) === digest(domainBinding), 'VERSION_INCOMPATIBLE', 'Evaluation domain rules, features, knowledge updater, fallback baseline, continuation or context differ from release binding');
+  invariant(digest(adapter.domainDependencies) === digest(domainBinding), 'VERSION_INCOMPATIBLE', 'Evaluation domain rules, features, knowledge updater, continuation or context differ from release binding');
   const signal = options.signal ?? new AbortController().signal;
   const evidence: EvaluationEvidence = { adapterId: adapter.id, protocolDigest: digest(protocol), modelKind: model.kind, blocks: [], costs: { modelCalls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, usageUnknown: false } };
   const groups: Record<string, { meanDifference: number; lowerBound: number }> = {};
   const byOpponent = new Map<string, number[]>();
   const paired: number[] = []; const latencies: number[] = [];
-  let decisions = 0, fallbacks = 0;
+  let decisions = 0;
   for (const seed of protocol.seeds) {
     const block: number[] = [];
     for (const opponentId of protocol.opponentIds) {
@@ -111,8 +115,40 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
       const run = async (strategy: StrategyPackage): Promise<EvaluationEpisode> => {
         let knowledge: Features = structuredClone(protocol.initialKnowledge);
         if (protocol.knowledgeStateMode === 'frozen') knowledge = deepFreeze(knowledge);
-        const result = await adapter.episode({ strategy: structuredClone(strategy), model, seed, opponentId, trajectories: protocol.trajectoriesPerSeed, knowledge, knowledgeStateMode: protocol.knowledgeStateMode, signal });
-        signal.throwIfAborted(); validateEpisode(result); return result;
+        let calls = 0, completed = 0, pending = 0, modelFailed = false;
+        let firstModelFailure: unknown;
+        const checkedModel: DecisionModel = {
+          id: model.id, kind: model.kind,
+          async score(request) {
+            if (modelFailed) throw firstModelFailure;
+            calls++; pending++;
+            const aborted = () => {
+              if (!modelFailed) firstModelFailure = request.signal.reason;
+              modelFailed = true;
+            };
+            request.signal.addEventListener('abort', aborted, { once: true });
+            try {
+              request.signal.throwIfAborted();
+              const response = await model.score(request);
+              request.signal.throwIfAborted();
+              invariant(response && (response.model === model.id || model.kind === 'fixture'), 'VERSION_INCOMPATIBLE', 'Evaluation model returned a different version');
+              invariant(response.answers && typeof response.answers === 'object' && !Array.isArray(response.answers) && Object.keys(response.answers).length === request.questions.length, 'MODEL_INVALID', 'Evaluation model answer set differs from requested questions');
+              invariant(request.questions.length > 0, 'MODEL_INVALID', 'An empty question set cannot authorize a decision');
+              for (const question of request.questions) validateScoreAnswer(response.answers[question.id], question.criteria.length);
+              completed++;
+              return response;
+            } catch (error) { if (!modelFailed) firstModelFailure = error; modelFailed = true; throw error; }
+            finally { pending--; request.signal.removeEventListener('abort', aborted); }
+          },
+        };
+        const result = await adapter.episode({ strategy: structuredClone(strategy), model: checkedModel, seed, opponentId, trajectories: protocol.trajectoriesPerSeed, knowledge, knowledgeStateMode: protocol.knowledgeStateMode, signal });
+        signal.throwIfAborted();
+        if (modelFailed) throw firstModelFailure;
+        invariant(pending === 0, 'VALIDATION_REJECTED', 'Episode contains an unfinished model decision');
+        validateEpisode(result);
+        // Fixtures may supply precomputed statistical summaries. Real experiments must account for every decision.
+        invariant(model.kind === 'fixture' || (completed >= result.decisions && result.modelCalls === calls), 'VALIDATION_REJECTED', 'Every real experimental decision requires a completed model call and accurate call accounting');
+        return result;
       };
       // Alternating order catches accidental ordering assumptions without sharing mutable state.
       let a: EvaluationEpisode, b: EvaluationEpisode;
@@ -129,18 +165,16 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
       }
       block.push(difference);
       const group = byOpponent.get(opponentId) ?? []; group.push(difference); byOpponent.set(opponentId,group);
-      decisions += b.decisions; fallbacks += b.fallbacks; latencies.push(...b.latenciesMs);
+      decisions += b.decisions; latencies.push(...b.latenciesMs);
     }
     paired.push(block.reduce((a,b)=>a+b,0)/block.length);
   }
   for (const [opponent, values] of byOpponent) groups[opponent] = interval(values, protocol.confidenceLevel);
   const overall = interval(paired, protocol.confidenceLevel);
   latencies.sort((a,b)=>a-b);
-  const fallbackRate = decisions ? fallbacks/decisions : 0;
   const p95LatencyMs = latencies.length ? latencies[Math.ceil(latencies.length*.95)-1]! : 0;
   const reasons: string[] = [];
   let failed = false;
-  if (fallbackRate > protocol.maxFallbackRate) { failed = true; reasons.push('fallback_rate_exceeded'); }
   if (p95LatencyMs > protocol.maxP95LatencyMs) { failed = true; reasons.push('latency_limit_exceeded'); }
   if (Object.values(groups).some(g => g.meanDifference < -protocol.maxGroupRegression)) { failed = true; reasons.push('opponent_group_regression'); }
   if (overall.meanDifference < 0) { failed = true; reasons.push('negative_mean_improvement'); }
@@ -150,5 +184,5 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
   if (overall.lowerBound <= protocol.minimumImprovement) { insufficient = true; reasons.push('improvement_not_demonstrated'); }
   if (Object.values(groups).some(g=>g.lowerBound < -protocol.maxGroupRegression)) { insufficient = true; reasons.push('group_non_regression_not_demonstrated'); }
   options.onEvidence?.(structuredClone(evidence));
-  return { evaluationAdapterId: adapter.id, candidateDigest: digest(candidate), baseReleaseDigest, protocolDigest: digest(protocol), dependencies: structuredClone(dependencies), status: failed ? 'failed' : insufficient ? 'inconclusive' : 'passed', reasons, modelKind: model.kind, stage, sampleCount: paired.length, ...overall, groups, fallbackRate, p95LatencyMs, createdAt: Date.now() };
+  return { evaluationAdapterId: adapter.id, candidateDigest: digest(candidate), baseReleaseDigest, protocolDigest: digest(protocol), dependencies: structuredClone(dependencies), status: failed ? 'failed' : insufficient ? 'inconclusive' : 'passed', reasons, modelKind: model.kind, stage, sampleCount: paired.length, ...overall, groups, p95LatencyMs, createdAt: Date.now() };
 }

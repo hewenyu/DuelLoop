@@ -27,6 +27,9 @@ test('CLI init is offline, refuses overwrite, and doctor does not create a datab
     await assert.rejects(access(join(directory, 'data', 'duelloop.sqlite')));
     await assert.rejects(executeCli(['init','--dir',directory,'--domain','kuhn','--application','other','--scope','other']), { code: 'CONFLICT' });
     const config = await loadConfiguration(path); assert.equal(config.strategy, join(directory, 'strategy.json'));
+    const strategy=JSON.parse(await readFile(config.strategy,'utf8'));assert.equal(strategy.schemaVersion,'2.0');
+    assert.equal(Object.hasOwn(strategy,'fallback'),false);assert.equal(Object.hasOwn(strategy.decision,'minRequiredConfidence'),false);
+    const protocol=JSON.parse(await readFile(config.evaluation.finalProtocol,'utf8'));assert.equal(protocol.version,'2.0');assert.equal(Object.hasOwn(protocol,'maxFallbackRate'),false);
   });
 });
 
@@ -81,6 +84,8 @@ test('configuration schema rejects typos, embedded credentials, missing IDs/budg
       c => { c.decisionModel = { kind:'jev', model:'jev-pinned', apiKey:'SECRET', apiKeyEnv:'KEY', timeoutMs:1000 }; },
       c => { c.decisionModel = { kind:'jev', model:'jev-latest', apiKeyEnv:'KEY', timeoutMs:1000 }; },
       c => { c.runtime.mode = 'live'; }, c => { c.evaluation.finalProtocol = c.evaluation.developmentProtocol; },
+      c => { c.decisionModel.minRequiredConfidence = 0; }, c => { c.runtime.fallback = 'domain_baseline'; },
+      c => { c.evaluation.maxFallbackRate = 1; },
     ]) {
       const copy = structuredClone(raw); mutate(copy); assert.throws(() => validateConfiguration(copy), { code: 'CONFIG_INVALID' });
     }
@@ -127,7 +132,7 @@ test('CLI activate and rollback reject foreign scopes, invalid report bindings, 
         researchSnapshotId:store.snapshot('test-scope',Date.now()), evaluationProtocolDigest:store.putArtifact('protocol',{id},'private'),status:'created',data:{} });
       for (const [from,to] of [['created','researching'],['researching','candidate_locked'],['candidate_locked','final_evaluating'],['final_evaluating','completed_passed']]) store.transitionRun(run.id,[from],to);
       const validationDigest = store.putArtifact('validation_report',{candidateDigest:strategyDigest,baseReleaseDigest:base,protocolDigest:'test-protocol',dependencies,status:'passed',reasons:[],
-        modelKind:'fixture',stage,sampleCount:10,meanDifference:1,lowerBound:0.5,groups:{},fallbackRate:0,p95LatencyMs:1,createdAt:Date.now()},'private');
+        modelKind:'fixture',stage,sampleCount:10,meanDifference:1,lowerBound:0.5,groups:{},p95LatencyMs:1,createdAt:Date.now()},'private');
       return store.registerRelease({strategyDigest,dependencies,scopeId:'test-scope',expectedActiveDigest:base,validationDigest,source:'research',researchRunId:run.id});
     };
     const invalid = register('invalid-stage','development'); const fixtureRelease = register('fixture-evidence','final');

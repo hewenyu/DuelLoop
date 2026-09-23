@@ -5,7 +5,7 @@ import { episode, makeFixtureModel } from '../scripts/m0.mjs';
 const options = { hands: 4, timeoutMs: 5000, maxCalls: 100 };
 const knownUsage = { inputTokens: 7, outputTokens: 3, costUsd: 0.125, unknown: false };
 
-async function runRejectedResponse(path, usage) {
+async function runLowConfidenceResponse(path, usage) {
   const model = makeFixtureModel();
   if (path === 'jev_choice') {
     const original = model.choice.bind(model);
@@ -21,12 +21,12 @@ async function runRejectedResponse(path, usage) {
 }
 
 for (const path of ['jev_choice', 'jev_score']) {
-  test(`M0 ${path}: low confidence fallback preserves known response usage exactly once`, async () => {
-    const block = await runRejectedResponse(path, knownUsage);
+  test(`M0 ${path}: zero confidence remains a model action and preserves response usage exactly once`, async () => {
+    const block = await runLowConfidenceResponse(path, knownUsage);
     assert.equal(block.status, 'completed');
     assert.ok(block.modelCalls > 0);
-    assert.equal(block.fallbacks, block.modelCalls);
-    assert.equal(block.fallbackReasons.MODEL_INVALID, block.modelCalls);
+    assert.equal(block.stoppedDecisions, 0);
+    assert.equal(block.decisions, block.modelCalls);
     assert.deepEqual(block.usage, {
       inputTokens: block.modelCalls * 7,
       outputTokens: block.modelCalls * 3,
@@ -38,28 +38,30 @@ for (const path of ['jev_choice', 'jev_score']) {
 }
 
 test('M0 Score: missing price does not make recorded token counts unknown', async () => {
-  const block = await runRejectedResponse('jev_score', { inputTokens: 7, outputTokens: 3 });
+  const block = await runLowConfidenceResponse('jev_score', { inputTokens: 7, outputTokens: 3 });
   assert.equal(block.status, 'completed');
   assert.equal(block.usage.unknownTokenUsage, false);
   assert.equal(block.usage.unknownCost, true);
   assert.equal(block.usage.inputTokens, block.modelCalls * 7);
 });
 
-test('M0: missing response usage remains unknown after local rejection', async () => {
-  const block = await runRejectedResponse('jev_score', undefined);
+test('M0: missing response usage remains unknown', async () => {
+  const block = await runLowConfidenceResponse('jev_score', undefined);
   assert.equal(block.status, 'completed');
   assert.equal(block.usage.unknownTokenUsage, true);
   assert.equal(block.usage.unknownCost, true);
 });
 
-test('M0: transport failure without a response marks usage unknown and falls back', async () => {
+test('M0: transport failure stops before any action and marks usage unknown', async () => {
   const model = makeFixtureModel();
   model.score = async () => { throw Object.assign(new Error('Offline transport failure'), { code: 'MODEL_UNAVAILABLE' }); };
   const block = await episode('jev_score', 11, 'calling', options, model, { used: 0 });
-  assert.equal(block.status, 'completed');
-  assert.ok(block.modelCalls > 0);
-  assert.equal(block.fallbacks, block.modelCalls);
-  assert.equal(block.fallbackReasons.MODEL_UNAVAILABLE, block.modelCalls);
+  assert.equal(block.status, 'incomplete');
+  assert.equal(block.failureCode, 'MODEL_UNAVAILABLE');
+  assert.equal(block.modelCalls, 1);
+  assert.equal(block.decisions, 0);
+  assert.equal(block.hands, 0);
+  assert.equal(block.stoppedDecisions, 1);
   assert.deepEqual(block.usage, { inputTokens: 0, outputTokens: 0, knownCostUsd: 0, unknownTokenUsage: true, unknownCost: true });
 });
 
@@ -70,9 +72,27 @@ for (const path of ['jev_choice', 'jev_score']) {
       throw Object.assign(new Error('Malformed answer with known usage'), { code: 'MODEL_INVALID', context: { usage: knownUsage } });
     };
     const block = await episode(path, 11, 'calling', options, model, { used: 0 });
-    assert.equal(block.status, 'completed');
-    assert.ok(block.modelCalls > 0);
-    assert.equal(block.fallbacks, block.modelCalls);
+    assert.equal(block.status, 'incomplete');
+    assert.equal(block.failureCode, 'MODEL_INVALID');
+    assert.equal(block.modelCalls, 1);
+    assert.equal(block.decisions, 0);
+    assert.equal(block.stoppedDecisions, 1);
     assert.deepEqual(block.usage, { inputTokens: 7 * block.modelCalls, outputTokens: 3 * block.modelCalls, knownCostUsd: 0.125 * block.modelCalls, unknownTokenUsage: false, unknownCost: false });
+  });
+}
+
+for (const path of ['jev_choice', 'jev_score']) {
+  test(`M0 ${path}: changed model version stops and preserves known usage`, async () => {
+    const model = makeFixtureModel();
+    const method = path === 'jev_choice' ? 'choice' : 'score';
+    const original = model[method].bind(model);
+    model[method] = async input => ({ ...await original(input), model: 'unexpected-version', usage: knownUsage });
+    const block = await episode(path, 11, 'calling', options, model, { used: 0 });
+    assert.equal(block.status, 'incomplete');
+    assert.equal(block.failureCode, 'VERSION_INCOMPATIBLE');
+    assert.equal(block.decisions, 0);
+    assert.equal(block.modelCalls, 1);
+    assert.equal(block.usage.inputTokens, 7);
+    assert.equal(block.usage.unknownTokenUsage, false);
   });
 }

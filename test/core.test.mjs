@@ -18,14 +18,19 @@ function setup(options={}) {
   const runtime=new DuelLoop({applicationId:'test',domain,model,store,mode:'offline',executionOwner:'framework',...options});
   runtime.bootstrap(createKuhnStrategy(),'scope');return {domain,model,store,runtime};
 }
-test('rejected model answers retain known usage on the executed fallback decision',async()=>{
+test('rejected model answers retain known usage and stop without issuing execution',async()=>{
  const measured={inputTokens:71,outputTokens:13,unknown:false};
  const model={id:'rejected-answer',kind:'fixture',score:async()=>{throw new DuelLoopError('MODEL_INVALID','Bad answer',{usage:measured});}};
  const x=setup({model});
  try {
-  const {decision,receipt}=await x.runtime.step('usage-fallback');
-  assert.equal(decision.decisionSource,'domain_baseline');assert.equal(receipt.status,'completed');assert.deepEqual(decision.usage,measured);
+  let calls=0;x.domain.execute=async()=>{calls++;throw new Error('must never execute');};
+  await assert.rejects(()=>x.runtime.step('usage-stopped'),error=>error.code==='MODEL_INVALID'&&typeof error.context.decisionId==='string');
+  const decision=x.store.events().find(event=>event.type==='decision').data;
+  assert.equal(decision.decisionSource,'stopped');assert.equal(decision.action,null);assert.deepEqual(decision.usage,measured);
   assert.deepEqual(x.store.getArtifact(digest(decision)).usage,measured);
+  assert.equal(calls,0);assert.equal(x.store.intents().length,0);assert.equal(x.runtime.status().stopping,true);
+  assert.equal(x.runtime.status().failure.decisionId,decision.decisionId);
+  await assert.rejects(()=>x.runtime.start({streamIds:['usage-stopped'],maxSteps:1}),{code:'DECISION_STOPPED'});
  } finally {await x.runtime.close();x.store.close();}
 });
 const fakeRun=(store,id='run')=>store.createRun({id,scopeId:'scope',baseReleaseDigest:store.activeRelease('scope'),researchSnapshotId:store.snapshot('scope',Date.now()),evaluationProtocolDigest:store.putArtifact('protocol',{id:'p'},'private'),status:'created',data:{}});
@@ -40,10 +45,14 @@ function verifiedRelease(store,domain,model,version='v2') {
 
 test('strategy validates unknown fields, contracts, score limits and full dimension coverage',()=>{
   const domain=new KuhnPokerDomain();const s=createKuhnStrategy();
-  assert.equal(validateStrategy(s,domain).schemaVersion,'1.0');
+  assert.equal(validateStrategy(s,domain).schemaVersion,'2.0');
   for(const change of [s=>s.execute='rm -rf',s=>s.questions[0].criteria=Array(11).fill('x'),s=>s.stateProjection.push('opponent.hiddenCard'),s=>delete s.decision.defaultWeights.gain,s=>s.decision.selection={mode:'softmax_sample',tieBreak:'domain_priority',temperature:0}]){
     const x=structuredClone(s);change(x);assert.throws(()=>validateStrategy(x,domain));
   }
+  for(const change of [s=>s.decision.minRequiredConfidence=0,s=>s.fallback={mode:'domain_baseline'},s=>s.exitConditions=[]]){
+    const old=structuredClone(s);change(old);assert.throws(()=>validateStrategy(old,domain),{code:'STRATEGY_INVALID'});
+  }
+  assert.throws(()=>validateStrategy({...s,schemaVersion:'1.0'},domain),{code:'VERSION_INCOMPATIBLE'});
 });
 test('unknown condition stays unknown through negation; explicit false dominates all',()=>{
   const c={feature:'rate',op:'gte',value:.6};assert.equal(matchCondition(c,{}),null);assert.equal(matchCondition({not:c},{}),null);
@@ -59,18 +68,21 @@ test('softmax distribution, seeded sampling and arithmetic regression',async()=>
   assert.ok(Math.abs(count/10000-one.probabilities[a[0].id])<.025);
   const bad=structuredClone(answers.answers);bad[req.questions[0].id].score=Infinity;assert.throws(()=>evaluateAnswers(s,o,a,bad),{code:'MODEL_INVALID'});
 });
-test('shadow and host execution never invoke adapter, including forced and fallback paths',async()=>{
-  for(const source of ['strategy','forced','fallback']) for(const mode of ['shadow','offline']){
+test('shadow and host execution call models for single or multiple candidates and never execute',async()=>{
+  for(const source of ['multiple','single','failure']) for(const mode of ['shadow','offline']){
     const d=new KuhnPokerDomain({applicationId:'test',scopeId:'scope'});let calls=0;const execute=d.execute.bind(d);d.execute=async c=>{calls++;return execute(c);};
-    if(source==='forced'){const candidates=d.candidates.bind(d);d.candidates=async o=>(await candidates(o)).slice(0,1);}
-    const model=source==='fallback'?{id:'broken',kind:'fixture',score:async()=>{throw new Error('down');}}:fixture();
+    if(source==='single'){const candidates=d.candidates.bind(d);d.candidates=async o=>(await candidates(o)).slice(0,1);}
+    let modelCalls=0;const inner=fixture();
+    const model={id:inner.id,kind:'fixture',score:async request=>{modelCalls++;if(source==='failure')throw new Error('down');return inner.score(request);}};
     const store=new SqliteStore();const runtime=new DuelLoop({applicationId:'test',domain:d,model,store,mode,executionOwner:mode==='shadow'?'framework':'host'});
-    runtime.bootstrap(createKuhnStrategy(),'scope');const r=await runtime.step('a');assert.equal(calls,0);assert.equal(r.receipt,null);
-    assert.equal(r.decision.decisionSource,source==='forced'?'forced_action':source==='fallback'?'domain_baseline':'strategy');
+    runtime.bootstrap(createKuhnStrategy(),'scope');
+    if(source==='failure')await assert.rejects(()=>runtime.step('a'),{code:'MODEL_INVALID'});
+    else {const r=await runtime.step('a');assert.equal(r.receipt,null);assert.equal(r.decision.decisionSource,'strategy');}
+    assert.equal(calls,0);assert.equal(modelCalls,1);assert.equal(store.intents().length,0);
     await runtime.close();store.close();
   }
 });
-test('framework forced action still requires persisted intent and current state',async()=>{
+test('framework single-candidate model decision requires persisted intent and current state',async()=>{
   const x=setup();const c=x.domain.candidates.bind(x.domain);x.domain.candidates=async o=>(await c(o)).slice(0,1);
   let calls=0;x.domain.execute=async()=>{calls++;throw new Error();};x.store.saveIntent=()=>{throw new Error('disk full');};
   await assert.rejects(()=>x.runtime.step('a'),/disk full/);assert.equal(calls,0);await x.runtime.close();x.store.close();
@@ -182,4 +194,123 @@ test('application boundaries cover feedback, activation and reconciliation',asyn
   await assert.rejects(()=>other.activate(next.release),{code:'ACCESS_DENIED'});
   await assert.rejects(()=>other.reconcile('scope'),{code:'ACCESS_DENIED'});
   await other.close();await x.runtime.close();x.store.close();
+});
+
+test('confidence zero is recorded and the model-selected action executes',async()=>{
+  const inner=fixture();let modelCalls=0;
+  const model={id:inner.id,kind:'fixture',score:async request=>{
+    modelCalls++;const result=await inner.score(request);for(const answer of Object.values(result.answers))answer.confidence=0;return result;
+  }};
+  const x=setup({model});
+  try {
+    const {decision,receipt}=await x.runtime.step('zero-confidence');
+    assert.equal(modelCalls,1);assert.equal(decision.action.id,'bet');assert.equal(decision.decisionSource,'strategy');
+    assert.equal(receipt.status,'completed');assert(Object.values(decision.answers).every(answer=>answer.confidence===0));
+    assert.equal(x.runtime.status().stopping,false);
+  }finally{await x.runtime.close();x.store.close();}
+});
+
+test('missing, malformed, unavailable and mismatched model answers stop even with one candidate',async()=>{
+  for(const failure of ['missing','invalid','unavailable','wrong-version'])for(const single of [false,true]){
+    const inner=fixture();let modelCalls=0,executions=0;
+    const model={id:inner.id,kind:'real',score:async request=>{
+      modelCalls++;if(failure==='unavailable')throw new Error('network down');
+      const result=await inner.score(request);
+      if(failure==='missing')delete result.answers[request.questions[0].id];
+      if(failure==='invalid')result.answers[request.questions[0].id].score=NaN;
+      if(failure==='wrong-version')result.model='unexpected-model';
+      return result;
+    }};
+    const x=setup({model,mode:'simulation'});
+    try {
+      if(single){const candidates=x.domain.candidates.bind(x.domain);x.domain.candidates=async o=>(await candidates(o)).slice(0,1);}
+      x.domain.execute=async()=>{executions++;throw new Error('must never execute');};
+      await assert.rejects(()=>x.runtime.step('failure'),{code:failure==='wrong-version'?'VERSION_INCOMPATIBLE':'MODEL_INVALID'});
+      const stopped=x.store.events().find(event=>event.type==='decision').data;
+      assert.equal(stopped.decisionSource,'stopped');assert.equal(stopped.action,null);assert.equal(modelCalls,1);
+      assert.equal(executions,0);assert.equal(x.store.intents().length,0);
+      await assert.rejects(()=>x.runtime.step('failure'),{code:'CANCELLED'});assert.equal(modelCalls,1);
+    }finally{await x.runtime.close();x.store.close();}
+  }
+});
+
+test('model timeout stops the continuous loop and a late answer cannot execute',async()=>{
+  let finish;let entered;const called=new Promise(resolve=>{entered=resolve;});let calls=0,executions=0;
+  const inner=fixture();
+  const usage={inputTokens:9,outputTokens:2,costUsd:0,unknown:false};
+  const model={id:inner.id,kind:'fixture',score:async request=>{calls++;const result={...await inner.score(request),usage};entered();return new Promise(resolve=>{finish=()=>resolve(result);});}};
+  const x=setup({model,maxDecisionMs:60,executionReserveMs:5});
+  try {
+    x.domain.execute=async()=>{executions++;throw new Error('must never execute');};
+    const run=x.runtime.start({streamIds:['timeout'],maxSteps:4});
+    const rejected=assert.rejects(run,{code:'MODEL_TIMEOUT'});await called;await rejected;
+    await finish();await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(calls,1);assert.equal(executions,0);assert.equal(x.store.intents().length,0);
+    assert.equal(x.runtime.status().failure.code,'MODEL_TIMEOUT');
+    assert.equal(x.store.events().filter(event=>event.type==='decision').length,1);
+    const late=x.store.events().find(event=>event.type==='decision.late_model_result').data;
+    assert.deepEqual(late.usage,usage);assert.equal(late.decisionId,x.runtime.status().failure.decisionId);
+    assert.equal(x.store.events().find(event=>event.type==='decision').data.usage.unknown,true);
+  }finally{await x.runtime.close();x.store.close();}
+});
+
+test('a failed stream prevents another in-flight model answer from being executed',async()=>{
+  let finish;let entered;const called=new Promise(resolve=>{entered=resolve;});let executions=0;
+  const inner=fixture();let calls=0;
+  const model={id:inner.id,kind:'fixture',score:async request=>{
+    if(++calls===1){entered();return new Promise(resolve=>{finish=async()=>resolve(await inner.score(request));});}
+    throw new DuelLoopError('MODEL_INVALID','Second stream failed');
+  }};
+  const x=setup({model});
+  try {
+    x.domain.execute=async()=>{executions++;throw new Error('must never execute');};
+    const first=x.runtime.step('first');const firstRejected=assert.rejects(first,{code:'CANCELLED'});
+    await called;await assert.rejects(()=>x.runtime.step('second'),{code:'MODEL_INVALID'});
+    await finish();await firstRejected;
+    assert.equal(executions,0);assert.equal(x.store.intents().length,0);
+    assert.equal(x.store.events().filter(event=>event.type==='decision').length,2);
+  }finally{await x.runtime.close();x.store.close();}
+});
+
+test('no legal candidate stops without fabricating a wait or default action',async()=>{
+  let calls=0;const x=setup({model:{id:'unused',kind:'fixture',score:async()=>{calls++;throw new Error('no questions');}}});
+  try {
+    x.domain.candidates=async()=>[];
+    await assert.rejects(()=>x.runtime.step('empty'),error=>error.code==='DECISION_STOPPED'&&error.context.stopReason==='NO_LEGAL_ACTION');
+    const stopped=x.store.events().find(event=>event.type==='decision').data;
+    assert.equal(stopped.action,null);assert.equal(stopped.stopReason,'NO_LEGAL_ACTION');assert.equal(calls,0);
+    assert.equal(x.store.intents().length,0);
+  }finally{await x.runtime.close();x.store.close();}
+});
+
+test('a stop after durable intent but before send rejects the intent without executing',async()=>{
+  const x=setup();let executed=0;const save=x.store.saveIntent.bind(x.store);
+  try {
+    x.domain.execute=async()=>{executed++;throw new Error('must never send');};
+    x.store.saveIntent=intent=>{save(intent);queueMicrotask(()=>{void x.runtime.stop({drain:false});});};
+    await assert.rejects(()=>x.runtime.step('stop-before-send'),{code:'CANCELLED'});
+    assert.equal(executed,0);assert.equal(x.store.intents().length,1);
+    assert.equal(x.store.intents()[0].receipt.status,'rejected');
+    assert.equal(x.store.intents()[0].receipt.details.reason,'STOPPED_BEFORE_SEND');
+  }finally{await x.runtime.close();x.store.close();}
+});
+
+test('execution entry rejects persisted legacy non-model sources and old runtime bindings',async()=>{
+  for(const executionOwner of ['host','framework']){
+    const x=setup({executionOwner});
+    try {
+      const decision=await x.runtime.decide(await x.domain.observe('legacy'));
+      for(const source of ['domain_baseline','forced_action','abstain','stopped']){
+        const legacy={...decision,decisionSource:source};x.store.putArtifact('decision',legacy);
+        await assert.rejects(()=>executionOwner==='host'?x.runtime.prepareHostExecution(legacy):x.runtime.executeDecision(legacy),{code:'ACCESS_DENIED'});
+      }
+      assert.equal(x.store.intents().length,0);
+    }finally{await x.runtime.close();x.store.close();}
+  }
+  const x=setup();
+  try {
+    const binding=x.store.release(x.store.activeRelease('scope'));
+    const old=x.store.registerRelease({...binding,scopeId:'old-scope',dependencies:{...binding.dependencies,runtime:'duelloop-runtime-2'}});
+    await assert.rejects(()=>x.runtime.activate(old,true),{code:'VERSION_INCOMPATIBLE'});
+  }finally{await x.runtime.close();x.store.close();}
 });

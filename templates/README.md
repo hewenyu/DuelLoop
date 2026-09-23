@@ -10,4 +10,6 @@ Run `duelloop init --dir ./my-app --domain auction --application my-app --scope 
 
 as `domain` in `duelloop.json`. Match evaluator timing to `runtime.maxDecisionMs` and `runtime.executionReserveMs`. This example remains a simulation; supply your own persistent environment adapter before enabling `live`.
 
+Strategies and evaluation protocols use version `2.0`. Every runtime action, including a single legal candidate, requires a valid model response. Model failure stops the run; repair the cause, reconcile in-flight execution, and explicitly create a new runtime instance. The generated fixture is an explicit offline model, never a live failure replacement.
+
 See `docs/cli.md` for all commands, model configuration, research budgets, recovery, and data boundaries.
