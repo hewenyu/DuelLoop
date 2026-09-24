@@ -46,22 +46,48 @@ function jevError(error: unknown, signal: AbortSignal, usage?: ModelUsage): neve
 
 export interface JevOptions {
   model: string; apiKey?: string; apiKeyEnv?: string; baseURL?: string; timeoutMs?: number;
+  /** Pin aliases to a deployment revision; changing it requires fresh validation. */
+  deploymentVersion?: string;
+  /** Required for injected transports; never include credentials. */
+  transportVersion?: string;
   /** Explicit transport injection, e.g. for a proxy or an offline HTTP fixture. */
   fetch?: (input: string, init?: RequestInit) => Promise<Response>;
+}
+
+type JevBehaviorOptions=Pick<JevOptions,'model'|'baseURL'|'timeoutMs'|'deploymentVersion'|'transportVersion'|'fetch'>;
+function resolveJevTransport(options:Pick<JevOptions,'baseURL'|'timeoutMs'>):{baseURL:string;timeoutMs:number} {
+  const configured=options.baseURL??(process.env.TYPESAFE_BASE_URL?.trim()||'https://api.typesafe.ai');
+  let endpoint:URL;try{endpoint=new URL(configured);}catch{throw new DuelLoopError('CONFIG_INVALID','Invalid Jev endpoint');}
+  invariant(['http:','https:'].includes(endpoint.protocol),'CONFIG_INVALID','Jev endpoint requires HTTP or HTTPS');
+  invariant(!endpoint.username&&!endpoint.password&&!endpoint.search&&!endpoint.hash,'CONFIG_INVALID','Jev endpoint must not contain credentials, query parameters, or fragments');
+  const timeoutMs=options.timeoutMs??10000;
+  invariant(Number.isFinite(timeoutMs)&&timeoutMs>0,'CONFIG_INVALID','Jev timeout must be positive');
+  return {baseURL:endpoint.toString().replace(/\/+$/,''),timeoutMs};
+}
+/** Credential-free identity for release diagnostics and current qualification checks. */
+export function jevBehaviorIdentity(options:JevBehaviorOptions):DecisionModel['behaviorIdentity'] {
+  invariant(!options.fetch||typeof options.transportVersion==='string'&&options.transportVersion.length>0,'CONFIG_INVALID','Injected Jev transports require an explicit transportVersion');
+  invariant(options.deploymentVersion===undefined||typeof options.deploymentVersion==='string'&&options.deploymentVersion.length>0,'CONFIG_INVALID','Deployment version must be nonempty');
+  const transport=resolveJevTransport(options);
+  return Object.freeze({adapterVersion:'duelloop-jev-2/typesafe-sdk-0.6.0',deploymentVersion:options.deploymentVersion??options.model,
+    protocolVersion:'typesafe-systemone-score-v1',configurationDigest:digest({endpoint:transport.baseURL,timeoutMs:transport.timeoutMs,
+      transportVersion:options.transportVersion??'sdk-fetch',maxRetries:0})});
 }
 
 /** Actual TypeSafe SDK transport. The strategy runtime only consumes Score; Choice is the M0 control. */
 export class JevDecisionModel implements DecisionModel {
   readonly kind = 'real' as const;
   readonly id: string;
+  readonly behaviorIdentity: DecisionModel['behaviorIdentity'];
   readonly #client: TypeSafeClient;
   constructor(options: JevOptions) {
     invariant(typeof options.model === 'string' && options.model.trim(), 'CONFIG_INVALID', 'Jev model must be explicit');
-    if (options.timeoutMs !== undefined) invariant(Number.isFinite(options.timeoutMs) && options.timeoutMs > 0, 'CONFIG_INVALID', 'Jev timeout must be positive');
+    const transport=resolveJevTransport(options);
     this.id = options.model;
+    this.behaviorIdentity=jevBehaviorIdentity({...options,...transport});
     try {
       this.#client = new TypeSafeClient({ apiKey: credential(options.apiKey, options.apiKeyEnv ?? 'TYPESAFE_API_KEY'), defaultModel: options.model,
-        baseURL: options.baseURL, timeout: options.timeoutMs, fetch: options.fetch, logLevel: 'off', retry: { maxRetries: 0 } });
+        baseURL: transport.baseURL, timeout: transport.timeoutMs, fetch: options.fetch, logLevel: 'off', retry: { maxRetries: 0 } });
     } catch (error) {
       if (error instanceof DuelLoopError) throw error;
       throw new DuelLoopError('CONFIG_INVALID', 'Invalid Jev client configuration');
@@ -117,7 +143,11 @@ export class JevDecisionModel implements DecisionModel {
 /** Deterministic data fixtures are explicitly distinguished from real models in every decision record. */
 export class FixtureDecisionModel implements DecisionModel {
   readonly kind = 'fixture' as const;
-  constructor(readonly id: string, private readonly answer: (question: ScoreQuestion, state: Features) => ScoreAnswer) {}
+  readonly behaviorIdentity: DecisionModel['behaviorIdentity'];
+  constructor(readonly id: string, private readonly answer: (question: ScoreQuestion, state: Features) => ScoreAnswer, behaviorVersion=id) {
+    this.behaviorIdentity=Object.freeze({adapterVersion:'duelloop-fixture-2',deploymentVersion:behaviorVersion,
+      protocolVersion:'duelloop-score-v1',configurationDigest:digest({fixtureId:id,behaviorVersion})});
+  }
   async score(request: { state: Features; questions: ScoreQuestion[]; signal: AbortSignal }) {
     cancelled(request.signal);
     return { answers: Object.fromEntries(request.questions.map(q => [q.id, this.answer(q, request.state)])), model: this.id,

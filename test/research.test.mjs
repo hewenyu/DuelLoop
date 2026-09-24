@@ -6,21 +6,22 @@ import { KuhnPokerDomain, createKuhnStrategy } from '../dist/domains.js';
 import { buildQuestions } from '../dist/strategy.js';
 import { digest } from '../dist/utils.js';
 import { validateToolArguments } from '@earendil-works/pi-ai';
-import { decisionPolicyRuntimeVersion } from '../dist/runtime.js';
+import { decisionPolicyRuntimeVersion, modelBehaviorDigest } from '../dist/runtime.js';
 import { DuelLoopError } from '../dist/errors.js';
+const behaviorIdentity={adapterVersion:'research-test-fixture-v1',deploymentVersion:'research-test-v1',protocolVersion:'score-v1',configurationDigest:digest({fixture:true})};
 const decisionPolicy = { maxDecisionMs: 5000, executionReserveMs: 25 };
 const evaluationQuestions=[{id:'gain:check',actionId:'check',dimensionId:'gain',instructions:'Fixture utility',criteria:['low','high']}];
 const evaluationAnswers={'gain:check':{score:0,confidence:0,probabilities:{'0':1,'1':0}}};
 const domainDependencies = { rules:'1', featureBuilder:'1', knowledgeUpdater:'1',  continuationPolicy:'1', contextDigest:digest(new KuhnPokerDomain().context) };
-const protocol = {version:'2.0',id:'final',domainId:'kuhn-poker',seeds:[701,702,703],opponentIds:['calling'],trajectoriesPerSeed:10,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'chips'},minSamples:3,minimumImprovement:0,maxGroupRegression:0,confidenceLevel:.95,maxP95LatencyMs:100,maxDevelopmentEvalRuns:2,maxFinalEvaluationsPerRun:1,holdoutId:'secret-holdout',maxHoldoutUses:1};
+const protocol = {version:'3.0',id:'final',domainId:'kuhn-poker',seeds:[701,702,703],opponentIds:['calling'],trajectoriesPerSeed:10,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'chips'},minSamples:3,minimumImprovement:0,maxGroupRegression:0,confidenceLevel:.95,maxP95DecisionComputeMs:100,maxDevelopmentEvalRuns:2,maxFinalEvaluationsPerRun:1,holdoutId:'secret-holdout',maxHoldoutUses:1};
 function setup(provider,extra={}) {
  const store=new SqliteStore(), domain=new KuhnPokerDomain({scopeId:'scope'}), baseline=createKuhnStrategy();
- const model={id:'fixture',kind:'fixture',score:async()=>{throw Error('not used by synthetic evaluator')}};
- const dependencies={model:model.id,runtime:decisionPolicyRuntimeVersion(decisionPolicy),rules:'1',featureBuilder:'1',knowledgeUpdater:'1',continuationPolicy:'1',contextDigest:digest(domain.context)};
+ const model={id:'fixture',kind:'fixture',behaviorIdentity,score:async()=>{throw Error('not used by synthetic evaluator')}};
+ const dependencies={model:model.id,modelKind:model.kind,modelBehaviorDigest:modelBehaviorDigest(model),runtime:decisionPolicyRuntimeVersion(decisionPolicy),rules:'1',featureBuilder:'1',knowledgeUpdater:'1',continuationPolicy:'1',contextDigest:digest(domain.context)};
  const release=store.registerRelease({strategyDigest:store.putArtifact('strategy',baseline),dependencies,scopeId:'scope',expectedActiveDigest:null,validationDigest:null,source:'bootstrap'});
  store.activate(release,dependencies);
  const now=Date.now(); store.recordFeedback({feedbackId:'experience',revision:1,eventTime:now,receivedAt:now,applicationId:'test',strategyScopeId:'scope',trajectoryId:'t',metrics:{reward:-1},settled:true});
- const evaluator={id:'synthetic-fixture-no-domain-performance-claim',decisionPolicy,domainDependencies,episode:async({strategy})=>({reward:strategy.version==='v1'?0:1,decisions:10,latenciesMs:Array(10).fill(1),modelCalls:0})};
+ const evaluator={id:'synthetic-fixture-no-domain-performance-claim',decisionPolicy,domainDependencies,episode:async({strategy})=>({reward:strategy.version==='v1'?0:1,decisions:10,decisionComputeLatenciesMs:Array(10).fill(1),modelCalls:0})};
  const orchestrator=new ResearchOrchestrator({store,domain,model,evaluator,dependencies,providers:{researcher:provider},...extra});
  const run=orchestrator.create({scopeId:'scope',protocol});
  return {store,domain,baseline,orchestrator,run,release};
@@ -75,8 +76,7 @@ test('single research uses one session, validates real contract and keeps final 
  assert.equal(f.store.getArtifact(result.run.data.evidenceDigest,{allowPrivate:true}).blocks.length,3);
  assert.equal(f.store.getRun(f.run.id).counters.finalEvaluations,1);
  await assert.rejects(f.orchestrator.run(f.run.id),e=>e.code==='CONFLICT');
- const second=f.orchestrator.create({scopeId:'scope',protocol});f.run=second;
- assert.equal((await f.orchestrator.run(second.id)).run.status,'budget_exhausted','new task ID cannot reset holdout use');
+ assert.throws(()=>f.orchestrator.create({scopeId:'scope',protocol}),e=>e.code==='HOLDOUT_UNAVAILABLE','new task ID cannot reset holdout use or start paid research');
  f.store.close();
 });
 test('new question wording invalidates old responses, and evidence cannot escape snapshot',()=>{
@@ -132,16 +132,16 @@ test('an evaluator cannot swallow model-budget failure to earn final approval',a
  const provider={id:'fixture',kind:'fixture',run:async input=>{if(input.role==='integrator') await input.tools.find(t=>t.name==='submit_candidate').execute(submission(f));return {output:{analysis:'synthetic'},usage};}};
  const evaluator={id:'error-swallowing',decisionPolicy,domainDependencies,episode:async({model,signal})=>{
   try { await model.score({state:{},questions:evaluationQuestions,signal}); } catch {}
-  return {reward:100,decisions:1,latenciesMs:[1],modelCalls:1};
+  return {reward:100,decisions:1,decisionComputeLatenciesMs:[1],modelCalls:1};
  }};
- f=setup(provider,{evaluator,model:{id:'fixture',kind:'fixture',score:async()=>({answers:evaluationAnswers,model:'fixture',usage:{unknown:true}})}});
+ f=setup(provider,{evaluator,model:{id:'fixture',kind:'fixture',behaviorIdentity,score:async()=>({answers:evaluationAnswers,model:'fixture',usage:{unknown:true}})}});
  const result=await f.orchestrator.run(f.run.id);
  assert.equal(result.run.status,'budget_exhausted');assert.equal(result.releaseDigest,undefined);assert.equal(f.store.activeRelease('scope'),f.release);f.store.close();
 });
 test('final failure terminates the task and never returns detailed holdout output to research',async()=>{
  let f;let calls=0;
  const provider={id:'fixture',kind:'fixture',run:async input=>{calls++;if(input.role==='integrator') await input.tools.find(t=>t.name==='submit_candidate').execute(submission(f));return {output:{analysis:'synthetic'},usage};}};
- f=setup(provider,{evaluator:{id:'negative-fixture',decisionPolicy,domainDependencies,episode:async({strategy})=>({reward:strategy.version==='v1'?1:0,decisions:1,latenciesMs:[1],modelCalls:0})}});
+ f=setup(provider,{evaluator:{id:'negative-fixture',decisionPolicy,domainDependencies,episode:async({strategy})=>({reward:strategy.version==='v1'?1:0,decisions:1,decisionComputeLatenciesMs:[1],modelCalls:0})}});
  const result=await f.orchestrator.run(f.run.id);assert.equal(result.run.status,'completed_failed');assert.equal(calls,3);assert.equal(result.releaseDigest,undefined);
  await assert.rejects(f.orchestrator.run(f.run.id),e=>e.code==='CONFLICT');assert.equal(f.store.listArtifacts('validation_report').length,0);f.store.close();
 });
@@ -161,7 +161,7 @@ test('two orchestrators cannot claim the same run or terminate the winner',async
   if(key==='getRun')return id=>{if(staleOnce&&id===f.run.id){staleOnce=false;return structuredClone(f.run);}return target.getRun(id);};
   const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;
  }});
- const second=new ResearchOrchestrator({store:racingStore,domain:f.domain,model:{id:'fixture',kind:'fixture',score:async()=>{throw Error('unused')}},evaluator:{id:'unused',decisionPolicy,domainDependencies,episode:async()=>{throw Error('unused')}},dependencies:f.store.release(f.release).dependencies,providers:{researcher:provider}});
+ const second=new ResearchOrchestrator({store:racingStore,domain:f.domain,model:{id:'fixture',kind:'fixture',behaviorIdentity,score:async()=>{throw Error('unused')}},evaluator:{id:'unused',decisionPolicy,domainDependencies,episode:async()=>{throw Error('unused')}},dependencies:f.store.release(f.release).dependencies,providers:{researcher:provider}});
  const winner=f.orchestrator.run(f.run.id);await ready;
  await assert.rejects(second.run(f.run.id),e=>e.code==='CONFLICT');assert.equal(f.store.getRun(f.run.id).status,'researching');
  release();assert.equal((await winner).run.status,'no_change');f.store.close();
@@ -170,7 +170,7 @@ test('cross-worker cancellation preserves measured late charges without reviving
  let resolve,started;const ready=new Promise(r=>started=r);
  const provider={id:'fixture',kind:'fixture',run:()=>{started();return new Promise(r=>resolve=r);}};
  const f=setup(provider);
- const second=new ResearchOrchestrator({store:f.store,domain:f.domain,model:{id:'fixture',kind:'fixture',score:async()=>{throw Error('unused')}},evaluator:{id:'unused',decisionPolicy,domainDependencies,episode:async()=>{throw Error('unused')}},dependencies:f.store.release(f.release).dependencies,providers:{researcher:provider}});
+ const second=new ResearchOrchestrator({store:f.store,domain:f.domain,model:{id:'fixture',kind:'fixture',behaviorIdentity,score:async()=>{throw Error('unused')}},evaluator:{id:'unused',decisionPolicy,domainDependencies,episode:async()=>{throw Error('unused')}},dependencies:f.store.release(f.release).dependencies,providers:{researcher:provider}});
  const pending=f.orchestrator.run(f.run.id);await ready;
  assert.equal(second.cancel(f.run.id).status,'cancelled');
  const measured={inputTokens:17,outputTokens:23,costUsd:.12,unknown:false};
@@ -186,8 +186,8 @@ test('zero remaining tokens prevent evaluation requests both at entry and betwee
  for(const maxTokensTotal of [60,61]) {
   let f,actualCalls=0;
   const provider={id:'fixture',kind:'fixture',run:async input=>{if(input.role==='integrator')await input.tools.find(t=>t.name==='submit_candidate').execute(submission(f));return {output:{analysis:'synthetic'},usage};}};
-  const model={id:'fixture',kind:'fixture',score:async()=>{actualCalls++;return {answers:evaluationAnswers,model:'fixture',usage:{inputTokens:1,outputTokens:0,costUsd:0}};}};
-  const evaluator={id:'calls-real-injected-interface',decisionPolicy,domainDependencies,episode:async({model,signal})=>{await model.score({state:{},questions:evaluationQuestions,signal});return {reward:1,decisions:1,latenciesMs:[1],modelCalls:1};}};
+  const model={id:'fixture',kind:'fixture',behaviorIdentity,score:async()=>{actualCalls++;return {answers:evaluationAnswers,model:'fixture',usage:{inputTokens:1,outputTokens:0,costUsd:0}};}};
+  const evaluator={id:'calls-real-injected-interface',decisionPolicy,domainDependencies,episode:async({model,signal})=>{await model.score({state:{},questions:evaluationQuestions,signal});return {reward:1,decisions:1,decisionComputeLatenciesMs:[1],modelCalls:1};}};
   f=setup(provider,{model,evaluator,budget:{maxTokensTotal}});
   const result=await f.orchestrator.run(f.run.id);
   assert.equal(result.run.status,'budget_exhausted');assert.equal(actualCalls,maxTokensTotal-60,'no score may start when remaining tokens are zero');
@@ -281,8 +281,8 @@ test('experience queries page bounded summaries and retrieve exact immutable evi
 
 test('joint budget counts in-flight provider usage before each nested development call',async()=>{
  let f,modelCalls=0,providerCalls=0,remaining;
- const model={id:'fixture',kind:'fixture',score:async()=>{modelCalls++;return {answers:evaluationAnswers,model:'fixture',usage:{inputTokens:10,outputTokens:0,unknown:false}};}};
- const evaluator={id:'joint-budget-fixture',decisionPolicy,domainDependencies,episode:async({model,signal})=>{for(let n=0;n<6;n++)await model.score({state:{},questions:evaluationQuestions,signal});return {reward:1,decisions:6,latenciesMs:[1],modelCalls:6};}};
+ const model={id:'fixture',kind:'fixture',behaviorIdentity,score:async()=>{modelCalls++;return {answers:evaluationAnswers,model:'fixture',usage:{inputTokens:10,outputTokens:0,unknown:false}};}};
+ const evaluator={id:'joint-budget-fixture',decisionPolicy,domainDependencies,episode:async({model,signal})=>{for(let n=0;n<6;n++)await model.score({state:{},questions:evaluationQuestions,signal});return {reward:1,decisions:6,decisionComputeLatenciesMs:[1],modelCalls:6};}};
  const measured={inputTokens:50,outputTokens:0,unknown:false};
  const provider={id:'joint-budget',kind:'fixture',run:async input=>{
   providerCalls++;input.onUsage(measured);assert.equal(input.getRemainingTokens(),100,'callback excludes outstanding local provider usage');
@@ -305,7 +305,7 @@ test('unknown in-flight research usage blocks evaluation and further provider ca
   await input.tools.find(tool=>tool.name==='run_development_eval').execute({strategy:f.baseline});
   return {output:{status:'no_change'},usage:{unknown:true}};
  }};
- const model={id:'fixture',kind:'fixture',score:async()=>{paidCalls++;throw Error('must not call');}};
+ const model={id:'fixture',kind:'fixture',behaviorIdentity,score:async()=>{paidCalls++;throw Error('must not call');}};
  f=setup(provider,{model});const result=await f.orchestrator.run(f.run.id);
  assert.equal(result.run.status,'budget_exhausted');assert.equal(calls,1);assert.equal(paidCalls,0);await new Promise(resolve=>setImmediate(resolve));f.store.close();
 });
@@ -329,8 +329,8 @@ test('failed evaluation calls account known tokens once and stop all calls when 
  for(const known of [true,false]) {
   let f,calls=0;
   const provider={id:'failed-evaluation-cost',kind:'fixture',run:async input=>{if(input.role==='integrator')await input.tools.find(tool=>tool.name==='submit_candidate').execute(submission(f));return {output:{analysis:'fixture'},usage};}};
-  const model={id:'fixture',kind:'fixture',score:async()=>{calls++;throw new DuelLoopError('MODEL_INVALID','Semantic response rejected',known?{usage:{inputTokens:7,outputTokens:3,unknown:false}}:{});}};
-  const evaluator={id:'failed-model-swallowing',decisionPolicy,domainDependencies,episode:async({model,signal})=>{for(let i=0;i<2;i++)try{await model.score({state:{},questions:evaluationQuestions,signal});}catch{}return {reward:0,decisions:2,latenciesMs:[1,1],modelCalls:2};}};
+  const model={id:'fixture',kind:'fixture',behaviorIdentity,score:async()=>{calls++;throw new DuelLoopError('MODEL_INVALID','Semantic response rejected',known?{usage:{inputTokens:7,outputTokens:3,unknown:false}}:{});}};
+  const evaluator={id:'failed-model-swallowing',decisionPolicy,domainDependencies,episode:async({model,signal})=>{for(let i=0;i<2;i++)try{await model.score({state:{},questions:evaluationQuestions,signal});}catch{}return {reward:0,decisions:2,decisionComputeLatenciesMs:[1,1],modelCalls:2};}};
   f=setup(provider,{model,evaluator});const result=await f.orchestrator.run(f.run.id);
   const events=f.store.events({allowPrivate:true}).filter(event=>event.type==='research.evaluation_model_usage');
   assert.equal(result.releaseDigest,undefined);assert.equal(f.store.activeRelease('scope'),f.release);
@@ -367,4 +367,31 @@ test('phase prompts expose actionable roles and remaining budgets without promis
  assert.match(prompts[3].phaseContract.objective,/In a new round/);
  assert.match(prompts[5].phaseContract.completion,/last round.*no_change/);
  assert.equal(prompts[5].phaseContract.remaining.rounds,0);assert.equal(result.run.counters.finalEvaluations,undefined);f.store.close();
+});
+
+test('a created run whose holdout was consumed elsewhere becomes waiting_protocol before any paid call',async()=>{
+ let calls=0;const f=setup({id:'unused-research',kind:'fixture',run:async()=>{calls++;return {output:{status:'no_change'},usage};}});
+ const binding=f.store.release(f.release),otherRelease=f.store.registerRelease({...binding,scopeId:'other'});
+ f.store.activate(otherRelease,binding.dependencies);
+ const other=f.store.createRun({id:'competing-research',scopeId:'other',baseReleaseDigest:otherRelease,researchSnapshotId:f.run.researchSnapshotId,evaluationProtocolDigest:f.run.evaluationProtocolDigest,status:'created',data:{}});
+ for(const [from,to] of [['created','researching'],['researching','candidate_locked'],['candidate_locked','final_evaluating']])f.store.transitionRun(other.id,[from],to);
+ f.store.claimHoldout(protocol.holdoutId,other.id,1);
+ const result=await f.orchestrator.run(f.run.id);
+ assert.equal(result.run.status,'waiting_protocol');assert.deepEqual(result.run.counters,{});assert.equal(calls,0);
+ assert.equal(f.store.activeRun('scope'),undefined,'A waiting task must not block future independent research');
+ assert.equal(f.orchestrator.recover(f.run.id).status,'waiting_protocol');
+ assert.throws(()=>f.orchestrator.create({scopeId:'scope',protocol}),e=>e.code==='HOLDOUT_UNAVAILABLE');
+ const next=f.orchestrator.create({scopeId:'scope',protocol:{...protocol,id:'independent',holdoutId:'independent',seeds:[901,902,903]}});
+ assert.equal((await f.orchestrator.run(next.id)).run.status,'no_change');assert.equal(calls,1);f.store.close();
+});
+
+test('research history tool requests only a bounded scope-local projection',async()=>{
+ let f,checked=false;
+ const provider={id:'history-fixture',kind:'fixture',run:async input=>{
+  const original=f.store.events.bind(f.store);
+  f.store.events=options=>{assert.equal(options.scopeId,'scope');assert.equal(options.limit,100);assert.equal(options.descending,true);assert.deepEqual(options.types,['research.role_output','research.candidate_submitted','research.development_result']);return original(options);};
+  const history=await input.tools.find(t=>t.name==='query_research_history').execute({});
+  assert.ok(history.length<=100);checked=true;f.store.events=original;return {output:{status:'no_change'},usage};
+ }};
+ f=setup(provider);assert.equal((await f.orchestrator.run(f.run.id)).run.status,'no_change');assert.equal(checked,true);f.store.close();
 });

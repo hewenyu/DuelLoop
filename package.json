@@ -1,6 +1,6 @@
 {
   "name": "duelloop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A dual-loop SDK for adversarial decision applications",
   "type": "module",
   "license": "MIT",
@@ -34,6 +34,7 @@
     "demo": "npm run check:package",
     "benchmark": "npm run build && node scripts/benchmark.mjs --fixture",
     "benchmark:concurrency": "npm run build && node scripts/concurrency-benchmark.mjs --fixture",
+    "benchmark:history": "npm run build && node scripts/history-benchmark.mjs",
     "experiment:m0": "npm run build && node scripts/m0.mjs",
     "check:package": "npm run build && node scripts/check-package.mjs",
     "prepack": "npm run build"

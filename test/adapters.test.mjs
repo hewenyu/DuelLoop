@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { mkdtemp, mkdir, writeFile, rm, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JevDecisionModel, PiResearchProvider, FixtureDecisionModel } from '../dist/adapters.js';
+import { JevDecisionModel, PiResearchProvider, FixtureDecisionModel, jevBehaviorIdentity } from '../dist/adapters.js';
 
 const q = { id: 'call_gain', actionId: 'call', dimensionId: 'gain', instructions: 'Evaluate call to trajectory end.', criteria: ['Guaranteed loss', 'Uncertain result', 'Guaranteed gain'] };
 const signal = () => new AbortController().signal;
@@ -15,7 +15,7 @@ const json = value => new Response(JSON.stringify(value), { headers: { 'content-
 
 test('Jev uses the real SDK request mapper, preserves fractional expected scores, and records actual model/usage', async () => {
   let request;
-  const model = new JevDecisionModel({ model: 'jev-configured', apiKey: 'fixture-key', fetch: async (url, init) => {
+  const model = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-configured', apiKey: 'fixture-key', fetch: async (url, init) => {
     request = { url, body: JSON.parse(init.body), signal: init.signal };
     return json(jevResponse());
   } });
@@ -34,10 +34,10 @@ test('Jev uses the real SDK request mapper, preserves fractional expected scores
 test('Jev rejects missing/malformed scores and more than ten levels', async () => {
   for (const response of [jevResponse({ answers: {} }), jevResponse({ answers: { call_gain: { type: 'score', score: 20, confidence: 1, probabilities: {} } } }),
     jevResponse({ answers: { call_gain: { type: 'score', score: 1, confidence: 1, probabilities: { 0: 0.1, 1: 0.1, 2: 0.1 } } } })]) {
-    const model = new JevDecisionModel({ model: 'jev-test', apiKey: 'fixture', fetch: async () => json(response) });
+    const model = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-test', apiKey: 'fixture', fetch: async () => json(response) });
     await assert.rejects(model.score({ state: {}, questions: [q], signal: signal() }), { code: 'MODEL_INVALID' });
   }
-  const model = new JevDecisionModel({ model: 'jev-test', apiKey: 'fixture', fetch: async () => assert.fail('Invalid criteria must not call API') });
+  const model = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-test', apiKey: 'fixture', fetch: async () => assert.fail('Invalid criteria must not call API') });
   await assert.rejects(model.score({ state: {}, questions: [{ ...q, criteria: Array(11).fill('same') }], signal: signal() }), { code: 'CONFIG_INVALID' });
 });
 
@@ -45,7 +45,7 @@ test('Jev normalizes the observed 0.99 Score distribution without changing model
   // Distribution observed in the independent development probe; replayed without network access.
   const raw = { 0: 0.81, 1: 0.11, 2: 0.05, 3: 0.01, 4: 0.01 };
   const question = { ...q, criteria: ['0', '1', '2', '3', '4'] };
-  const model = new JevDecisionModel({ model: 'jev-test', apiKey: 'fixture', fetch: async () => json(jevResponse({
+  const model = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-test', apiKey: 'fixture', fetch: async () => json(jevResponse({
     answers: { call_gain: { type: 'score', score: 0.3, confidence: 0.75, probabilities: raw } },
   })) });
   const result = (await model.score({ state: {}, questions: [question], signal: signal() })).answers.call_gain;
@@ -68,7 +68,7 @@ test('Jev preserves validated response usage when Score or Choice answers are re
   ];
   for (const [kind, responses] of [['score', scoreResponses], ['choice', choiceResponses]]) {
     for (const response of responses) {
-      const model = new JevDecisionModel({ model: 'jev-test', apiKey: 'SUPER_SECRET', fetch: async () => json({ ...response, privateBody: 'PRIVATE_BODY_SENTINEL' }) });
+      const model = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-test', apiKey: 'SUPER_SECRET', fetch: async () => json({ ...response, privateBody: 'PRIVATE_BODY_SENTINEL' }) });
       const call = kind === 'score'
         ? model.score({ state: {}, questions: [q], signal: signal() })
         : model.choice({ state: {}, instructions: 'Choose', candidates: { check: 'Pass', bet: 'Stake' }, signal: signal() });
@@ -88,7 +88,7 @@ test('Jev cannot invent usage for malformed usage or failed transport', async ()
     async () => json(jevResponse({ usage: { input_tokens: -1, output_tokens: 12 } })),
     async () => new Response('PRIVATE_BODY_SENTINEL', { status: 503 }),
   ]) {
-    const model = new JevDecisionModel({ model: 'jev-test', apiKey: 'SUPER_SECRET', fetch });
+    const model = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-test', apiKey: 'SUPER_SECRET', fetch });
     await assert.rejects(model.score({ state: {}, questions: [q], signal: signal() }), error => {
       assert.equal(error.code, 'MODEL_INVALID');
       assert.deepEqual(error.context.usage, { unknown: true });
@@ -109,7 +109,7 @@ test('Jev Choice normalizes only within the existing 0.01 probability sum tolera
     [{ check: 1.1, bet: -0.1 }, false],
     [{ check: 1, unexpected: 0 }, false],
   ]) {
-    const model = new JevDecisionModel({ model: 'jev-test', apiKey: 'fixture', fetch: async () => json({ model: 'jev-test',
+    const model = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-test', apiKey: 'fixture', fetch: async () => json({ model: 'jev-test',
       answers: { action: { type: 'choice', choice: 'check', confidence: 0.75, probabilities: distribution } }, usage: { input_tokens: 10, output_tokens: 2 } }) });
     const pending = model.choice({ state: {}, instructions: 'Choose', candidates: { check: 'Pass', bet: 'Stake' }, signal: signal() });
     if (!accepted) { await assert.rejects(pending, { code: 'MODEL_INVALID' }); continue; }
@@ -122,7 +122,7 @@ test('Jev Choice normalizes only within the existing 0.01 probability sum tolera
 });
 
 test('Jev Choice is an independent control path and does not use Score assumptions', async () => {
-  const model = new JevDecisionModel({ model: 'jev-test', apiKey: 'fixture', fetch: async (_url, init) => {
+  const model = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-test', apiKey: 'fixture', fetch: async (_url, init) => {
     const body = JSON.parse(init.body);
     assert.equal(body.questions.action.type, 'choice');
     return json({ model: 'jev-test', answers: { action: { type: 'choice', choice: 'check', confidence: 0.9, probabilities: { check: 0.8, bet: 0.2 } } }, usage: { input_tokens: 10, output_tokens: 2 } });
@@ -133,12 +133,12 @@ test('Jev Choice is an independent control path and does not use Score assumptio
 
 test('Jev cancellation reaches transport; provider error bodies and API keys never enter framework errors', async () => {
   const controller = new AbortController();
-  const model = new JevDecisionModel({ model: 'jev-test', apiKey: 'SUPER_SECRET', fetch: async (_url, init) => {
+  const model = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-test', apiKey: 'SUPER_SECRET', fetch: async (_url, init) => {
     queueMicrotask(() => controller.abort());
     return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new Error('SUPER_SECRET')), { once: true }));
   } });
   await assert.rejects(model.score({ state: {}, questions: [q], signal: controller.signal }), error => error.code === 'CANCELLED' && !JSON.stringify(error).includes('SUPER_SECRET'));
-  const failing = new JevDecisionModel({ model: 'jev-test', apiKey: 'SUPER_SECRET', fetch: async () => new Response('SUPER_SECRET private input', { status: 401 }) });
+  const failing = new JevDecisionModel({ transportVersion: 'test-fixture-1', model: 'jev-test', apiKey: 'SUPER_SECRET', fetch: async () => new Response('SUPER_SECRET private input', { status: 401 }) });
   await assert.rejects(failing.score({ state: {}, questions: [q], signal: signal() }), error => error.code === 'MODEL_INVALID' && error.context.status === 401 && !JSON.stringify(error).includes('SUPER_SECRET'));
 });
 
@@ -436,4 +436,46 @@ test('fixture models are labeled and never charged as model calls', async () => 
   assert.equal(model.kind, 'fixture');
   const result = await model.score({ state: {}, questions: [q], signal: signal() });
   assert.equal(result.usage.costUsd, 0);
+});
+
+test('Jev behavior identity binds endpoint, deployment and transport without credentials',()=>{
+  const base={model:'jev-pinned',apiKey:'secret-one'};const a=new JevDecisionModel(base);
+  const credentials=new JevDecisionModel({...base,apiKey:'secret-two'});assert.deepEqual(a.behaviorIdentity,credentials.behaviorIdentity);
+  const proxy=new JevDecisionModel({...base,baseURL:'https://proxy.example/v1'});assert.notEqual(a.behaviorIdentity.configurationDigest,proxy.behaviorIdentity.configurationDigest);
+  assert.notEqual(new JevDecisionModel({...base,deploymentVersion:'revision-2'}).behaviorIdentity.deploymentVersion,a.behaviorIdentity.deploymentVersion);
+  assert.throws(()=>new JevDecisionModel({...base,fetch:async()=>json({})}),{code:'CONFIG_INVALID'});
+  assert.throws(()=>new JevDecisionModel({...base,baseURL:'https://example.org/v1?key=secret'}),{code:'CONFIG_INVALID'});
+  assert.ok(!JSON.stringify(a.behaviorIdentity).includes('secret'));
+});
+
+test('Jev identity resolves SDK defaults and normalized explicit configuration equivalently',()=>{
+  const previous=process.env.TYPESAFE_BASE_URL;
+  try {
+    delete process.env.TYPESAFE_BASE_URL;
+    const defaults=jevBehaviorIdentity({model:'pinned'});
+    assert.deepEqual(defaults,jevBehaviorIdentity({model:'pinned',baseURL:'https://api.typesafe.ai///',timeoutMs:10000}));
+    process.env.TYPESAFE_BASE_URL='   ';
+    assert.deepEqual(defaults,jevBehaviorIdentity({model:'pinned'}));
+    assert.notEqual(defaults.configurationDigest,jevBehaviorIdentity({model:'pinned',timeoutMs:20000}).configurationDigest);
+    process.env.TYPESAFE_BASE_URL='https://example.org?credential=never-log';
+    assert.throws(()=>jevBehaviorIdentity({model:'pinned'}),{code:'CONFIG_INVALID'});
+  } finally {if(previous===undefined)delete process.env.TYPESAFE_BASE_URL;else process.env.TYPESAFE_BASE_URL=previous;}
+});
+
+test('Jev environment endpoint changes qualification and the constructed transport keeps its resolved endpoint',async()=>{
+  const previous=process.env.TYPESAFE_BASE_URL;let requestedURL;
+  const base={model:'jev-configured',apiKey:'fixture-key',transportVersion:'test-fixture-1',fetch:async url=>{requestedURL=url;return json(jevResponse());}};
+  try {
+    process.env.TYPESAFE_BASE_URL='  https://first.example/proxy///  ';
+    const first=new JevDecisionModel(base);
+    assert.deepEqual(first.behaviorIdentity,jevBehaviorIdentity({...base,baseURL:'https://first.example/proxy',timeoutMs:10000}));
+    process.env.TYPESAFE_BASE_URL='https://second.example';
+    const second=new JevDecisionModel(base);
+    assert.notEqual(first.behaviorIdentity.configurationDigest,second.behaviorIdentity.configurationDigest);
+    await first.score({state:{},questions:[q],signal:signal()});assert.equal(requestedURL,'https://first.example/proxy/v1/systemone');
+    await second.score({state:{},questions:[q],signal:signal()});assert.equal(requestedURL,'https://second.example/v1/systemone');
+    const explicit=new JevDecisionModel({...base,baseURL:'https://api.typesafe.ai/',apiKey:'different-fixture-key'});
+    await explicit.score({state:{},questions:[q],signal:signal()});assert.equal(requestedURL,'https://api.typesafe.ai/v1/systemone');
+    assert.deepEqual(explicit.behaviorIdentity,new JevDecisionModel({...base,baseURL:'https://api.typesafe.ai',timeoutMs:10000}).behaviorIdentity);
+  } finally {if(previous===undefined)delete process.env.TYPESAFE_BASE_URL;else process.env.TYPESAFE_BASE_URL=previous;}
 });

@@ -6,7 +6,7 @@
 
 启动前固定应用 ID、策略作用域、领域与模型版本、数据库位置、执行模式和执行所有权。`app.bootstrap()` 仅初始化尚未发布的作用域；恢复已有库时先查 `store.activeRelease(scopeId)`，不要重新生成一个“初始发布”覆盖原状态。
 
-快循环通过 `app.start({ streamIds, maxSteps, intervalMs, signal })` 运行，也可以由自己的调度器调用 `step()`。同一流的并发步骤会被拒绝。`app.status()` 提供运行模式、在途步骤和未核对执行数量。
+快循环通过 `app.start({ streamIds, maxSteps, intervalMs, signal })` 运行，也可以由自己的调度器调用 `step()`。同一流的并发步骤会被拒绝。`app.status()` 提供运行模式、在途步骤、全部在途异步操作和未核对执行数量。`start({ signal })` 收到取消信号时会主动取消尚未完成的决策请求。
 
 ```js
 await app.stop({ drain: true, timeoutMs: 5000 });
@@ -14,7 +14,7 @@ await app.close();
 store.close();
 ```
 
-`stop()` 停止接收新步骤；默认等待已开始的步骤完成。`drain: false` 不等待，但不撤回已经发送给环境的动作。`app.close()` 释放本实例的执行所有权和事件订阅，SQLite 由持有它的应用显式 `store.close()`。共享同一 store 的研究工作应先停止，再关闭数据库。
+`stop()` 停止接收新决策并发出取消信号；默认等待直接 `decide()`、执行准备、执行、反馈、核对和底层请求结束后完成落库。`drain: false` 不等待，也不撤回已经发送给环境的动作。`app.close()` 释放本实例的执行所有权和事件订阅，SQLite 由持有它的应用显式 `store.close()`。共享同一 store 的研究工作应先停止，再关闭数据库。自定义模型忽略取消且仍未结束时，排空超时和 `close()` 会拒绝，实例不会宣称已关闭；保持 store 可用，待请求结束后重试。模型或领域回调内部若需停止，只调用 `stop({ drain: false })`，由外部生命周期拥有者排空，避免等待自身请求。
 
 ## 模型失败后的停止与恢复
 
@@ -31,9 +31,7 @@ store.close();
 执行前先持久化意图，发送后持久化回执。`accepted`、`unknown` 或缺失回执均属于未完成核对；不要为同一业务动作换一个新幂等键重试。
 
 ```js
-const unresolved = store.intents('policy').filter(intent =>
-  !intent.receipt || ['unknown', 'accepted'].includes(intent.receipt.status)
-);
+const unresolved = store.unresolvedIntents('policy');
 if (unresolved.length) await app.reconcile('policy');
 ```
 
@@ -61,11 +59,11 @@ restored.close();
 
 恢复检查只读打开源文件，验证 SQLite 格式、版本、必要表以及产物引用；空文件、其他应用的 SQLite 库、缺表或带未合并 WAL 的运行库都会拒绝。失败不把源文件初始化成空的 DuelLoop 数据库，也不修改其内容或权限。
 
-当前持久 Schema 版本为 1。打开空库时创建版本 1，打开更高版本时拒绝。当前没有需要迁移的历史生产 Schema，也不支持任意降级；“迁移检查”不表示已验证未来所有版本可互转。升级前保留可读备份，运行安装包检查和本领域回归；依赖改变后重新核对发布绑定。
+当前持久 Schema 版本为 2。空库初始化为 2；Schema 1 在写锁内原子迁移，保留历史证据、发布、执行和保留集额度。迁移再次检查版本，两个进程同时打开旧库不会重复修改表。未知较新版本拒绝，也不支持任意降级。升级前保留可读备份，运行安装包检查和本领域回归；依赖改变后重新核对发布绑定。
 
 ## 行为版本升级
 
-当前策略 `schemaVersion` 和评价协议 `version` 为 `2.0`，运行时为 `duelloop-runtime-3`，应用配置 Schema 与 SQLite Schema 仍为 1。旧策略的 `decision.minRequiredConfidence`、`exitConditions`、`fallback`，旧领域的 `baselineVersion`、`fallback()`，以及评价协议 `maxFallbackRate` 已删除；公开输入中的旧字段不能静默接受。
+当前策略 `schemaVersion` 为 `2.0`，评价协议 `version` 为 `3.0`，运行时为 `duelloop-runtime-4`，应用配置 Schema 为 1，SQLite Schema 为 2。协议性能字段改为 `maxP95DecisionComputeMs`，不代表完整 SDK 的 P95。旧策略的 `decision.minRequiredConfidence`、`exitConditions`、`fallback`，旧领域的 `baselineVersion`、`fallback()`，以及评价协议 `maxFallbackRate` 已删除；公开输入中的旧字段不能静默接受。
 
 升级前保留数据库备份与旧实验。历史 JSON 和反馈不做覆盖迁移；旧发布、轨迹绑定及验证报告也不获得新运行资格。使用新策略、新协议及当前行为依赖重新验证和登记发布；需要新的应用/作用域承接时由宿主显式选择，并正确接回环境和处理在途轨迹。不能删除数据库、清零保留集额度或把旧报告改写为新版来完成迁移。最终保留集已使用的实验，需要独立的新评价设计和新数据。
 
@@ -73,13 +71,15 @@ restored.close();
 
 `ResearchWorker` 从已结算反馈和持久触发记录判断样本门槛与冷却时间。同一作用域已有未完成研究时不再创建另一轮。构造参数包括 `orchestrator`、`store`、`scopeId`、最终和开发协议、`settledTrajectories`、`cooldownMs`，以及可选 `onRelease` 回调。
 
-触发器将上次研究的冻结快照与当前反馈的 `feedbackId`、`revision` 比较。同一接收时间戳的新事件和新修订都能计入新证据；重复消费同一修订不会再次触发。尚未达到研究门槛的轮询不持续创建历史快照。
+触发器使用最新反馈修订投影和持久 journal 游标。首次研究模型调用的预算扣次与触发游标在同一事务提交；相同宿主时间戳、乱序接收时间和新修订都能识别，重复修订不再次触发。空闲轮询只读取索引和汇总，不创建快照或加载全部历史。
+
+研究快照默认保留最新 1000 条决策及 1000 条反馈，可通过 `snapshotOptions: { maxDecisions, maxFeedback }` 调整，每项范围 1—10000。这是滚动窗口：已观察但落在窗口外的旧记录不会逐批重新触发研究；相邻研究的证据窗口允许重叠。触发游标控制新增经验是否足以开新研究，快照在自己的读取事务中固定具体修订。容量限制按字节另行设置，记录数上限不保证产物小于某个字节限额。
 
 ```js
 const worker = new ResearchWorker({
   orchestrator, store, scopeId: 'policy', protocol: finalProtocol, developmentProtocol,
   settledTrajectories: 100, cooldownMs: 60000,
-  onRelease: releaseDigest => app.activate(releaseDigest),
+  snapshotOptions: { maxDecisions: 1000, maxFeedback: 1000 },
 });
 const controller = new AbortController();
 const fast = app.start({ streamIds: ['table-1'], signal: controller.signal });
@@ -93,9 +93,11 @@ await Promise.allSettled([fast, slow]);
 
 这是 SDK 编排示意；停止信号应接在应用自身的生命周期中。两个循环共享事件循环时，长时间同步业务代码仍会阻塞决策；CPU 密集模拟应由应用放进独立进程或受控 worker。
 
-激活策略由 `store.setActivationMode(scopeId, mode)` 控制，支持 `candidate_only`、`automatic_after_validation`、`explicit`；`store.pauseActivation(scopeId, true)` 暂停切换。通过验证的研究只登记候选发布，激活需调用运行时并再次验证资格与领域边界。回退使用 `await app.rollback(scopeId, targetReleaseDigest)`，同时检查作用域、运行模式、完整验证绑定和领域边界；存储接口属于底层机制，不能代替运行时检查。回退不会改写在途轨迹；曾激活的历史版本不会再被自动调度，若确需重新启用，必须显式调用 `app.activate(digest, true)` 并满足当前基线及验证条件。已激活发布的验证被显式作废后，后续决策会停止，需要恢复兼容且有效的版本或重新验证。数据库通过作用域所属应用绑定拒绝其他应用接管同一作用域。
+激活策略由 `store.setActivationMode(scopeId, mode)` 控制，支持 `candidate_only`、`automatic_after_validation`、`explicit`；`store.pauseActivation(scopeId, true)` 暂停切换。通过验证的研究只登记候选发布；托管 `step()` 在边界独立调用 `activatePending(scopeId)`，嵌入应用由自己的边界调度调用它。无需用 `onRelease` 激活；该回调仅作可选通知。正常延期使用 `ACTIVATION_DEFERRED`，候选失效被标记，存储等故障仍向外抛出。边界未到不会结束研究轮询。直接 `activate()` 也区分延期和故障，并再次验证资格与领域边界。回退使用 `await app.rollback(scopeId, targetReleaseDigest)`，同时检查作用域、运行模式、完整验证绑定和领域边界；存储接口属于底层机制，不能代替运行时检查。回退不会改写在途轨迹；曾激活的历史版本不会再被自动调度，若确需重新启用，必须显式调用 `app.activate(digest, true)` 并满足当前基线及验证条件。已激活发布的验证被显式作废后，后续决策会停止，需要恢复兼容且有效的版本或重新验证。数据库通过作用域所属应用绑定拒绝其他应用接管同一作用域。
 
 `store.scopeStatus(scopeId, app.dependencies)` 可读取持久的激活模式、暂停状态、发布状态及阻塞原因。CLI `status` 不载入领域或发起模型调用，因此 `dependenciesChecked: false`，边界标记为 `not_checked`；`lastDeferral` 仅表示最近一次真实激活尝试的延期记录。诊断为 pending 不等于获得提交许可，实际激活仍重新检查依赖与当前边界。
+
+研究调用 `protocolAvailability(finalProtocol)` 预检最终资源；额度耗尽时 Worker 的 `status().state` 为 `waiting_protocol`，不调用模型也不消费触发反馈。新建任务会报 `HOLDOUT_UNAVAILABLE`；已创建任务遇到额度被其他研究用尽时进入 `waiting_protocol` 终态。最终阶段仍原子领取额度。协议和配额持久冻结，不能更换 ID 复用同领域种子，也不能增加已注册额度。SDK 用 `worker.updateProtocols({ protocol, developmentProtocol })` 配置独立的新资源；CLI 修改协议文件后重启研究 Worker。已有任务的协议不被替换。CLI `status` 显示带时间戳的最后一条 Worker 资源状态；它不是进程心跳。
 
 ## 资源、数据和信任范围
 
@@ -103,7 +105,7 @@ await Promise.allSettled([fast, slow]);
 
 解释器限制维度 16、分支 64、条件深度 12、条件总节点 256、展开问题 512、模型上下文 128KiB。研究有墙钟时间、Token、角色调用、决策模型调用、修复次数、轮数、开发评估和最终评估额度。未知费用保留为未知，不当作零费用。
 
-这些是逻辑预算，不是操作系统内存配额。SQLite 查询、研究快照和实验明细可能进入进程内存；大量历史需要应用制定保留、分页读取、归档与资源隔离方案。`store.pruneUnreferencedArtifacts({ dryRun: true })` 可预览未被引用的可清理产物，默认仅处理快照和行为夹具；执行清理前备份，再显式传 `dryRun: false`。清理保护事件、研究任务、发布和在途执行引用，不用于强行清空全部历史。当前没有无限规模保证。不要手动删除当前发布或验证结论唯一依赖的证据，否则回放与复核能力会丢失。
+这些是逻辑预算，不是操作系统内存配额。诊断/导出列表和实验明细仍可能进入进程内存；热路径已经按作用域、流、状态查询，研究快照有界。大量历史仍需应用制定保留、分页读取、归档与资源隔离方案。`events({ scopeId, afterId, types, limit })` 支持持久游标分页；显式请求历史 cutoff 的反馈修订回溯比当前快照昂贵。`store.pruneUnreferencedArtifacts({ dryRun: true })` 可预览未被引用的可清理产物，默认仅处理快照和行为夹具；执行清理前备份，再显式传 `dryRun: false`。清理保护事件、研究任务、发布和在途执行引用，不用于强行清空全部历史。完整 SDK 的历史规模/同库争用验收见[工程化修复](engineering-reliability.md)与[验证记录](validation.md)。同步 SQLite 和同步业务代码不能被异步超时硬抢占；需要按实际时限隔离进程并验证。不要手动删除当前发布或验证结论唯一依赖的证据，否则回放与复核能力会丢失。
 
 研究模型通过受控工具读取开发证据、提出候选和运行开发实验。pi provider 不扫描本机默认扩展、技能、上下文文件或默认命令工具。领域、存储、模型适配器和显式工具实现属于受信任程序代码；`private` 产物标志是研究工具的数据隔离，不是对数据库拥有者的加密或强制访问控制。
 

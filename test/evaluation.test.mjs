@@ -2,15 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateCandidate, validateProtocol } from '../dist/evaluation.js';
 import { createAuctionStrategy } from '../dist/domains.js';
-import { decisionPolicyRuntimeVersion } from '../dist/runtime.js';
+import { decisionPolicyRuntimeVersion, modelBehaviorDigest } from '../dist/runtime.js';
 const decisionPolicy = { maxDecisionMs: 5000, executionReserveMs: 25 };
 const baseline = createAuctionStrategy(); baseline.scope.domain = 'test'; baseline.version = '1';
 const candidate = structuredClone(baseline); candidate.version = '2';
-const model = {id:'fixture',kind:'fixture',score:async()=>{throw Error('unused');}};
-const dependencies = {model:'fixture',runtime:decisionPolicyRuntimeVersion(decisionPolicy),rules:'1',featureBuilder:'1',knowledgeUpdater:'1',continuationPolicy:'1',contextDigest:'test'};
-const { model: _model, runtime: _runtime, ...domainDependencies } = dependencies;
-const protocol = {version:'2.0',id:'test',domainId:'test',seeds:[1,2,3],opponentIds:['a','b'],trajectoriesPerSeed:10,knowledgeStateMode:'online_update',initialKnowledge:{nested:{count:0}},metric:{name:'reward',direction:'maximize',unit:'points'},minSamples:3,minimumImprovement:0,maxGroupRegression:4,confidenceLevel:.95,maxP95LatencyMs:100,maxDevelopmentEvalRuns:2,maxFinalEvaluationsPerRun:1,holdoutId:'test-holdout',maxHoldoutUses:1};
-const episode = reward => ({reward,decisions:10,latenciesMs:Array(10).fill(2),modelCalls:0});
+const identity = {adapterVersion:'evaluation-test-1',deploymentVersion:'fixture-1',protocolVersion:'score-1',configurationDigest:'fixture'};
+const model = {behaviorIdentity:identity,id:'fixture',kind:'fixture',score:async()=>{throw Error('unused');}};
+const dependencies = {model:'fixture',modelKind:model.kind,modelBehaviorDigest:modelBehaviorDigest(model),runtime:decisionPolicyRuntimeVersion(decisionPolicy),rules:'1',featureBuilder:'1',knowledgeUpdater:'1',continuationPolicy:'1',contextDigest:'test'};
+const { model: _model, modelKind: _kind, modelBehaviorDigest: _behavior, runtime: _runtime, ...domainDependencies } = dependencies;
+const protocol = {version:'3.0',id:'test',domainId:'test',seeds:[1,2,3],opponentIds:['a','b'],trajectoriesPerSeed:10,knowledgeStateMode:'online_update',initialKnowledge:{nested:{count:0}},metric:{name:'reward',direction:'maximize',unit:'points'},minSamples:3,minimumImprovement:0,maxGroupRegression:4,confidenceLevel:.95,maxP95DecisionComputeMs:100,maxDevelopmentEvalRuns:2,maxFinalEvaluationsPerRun:1,holdoutId:'test-holdout',maxHoldoutUses:1};
+const episode = reward => ({reward,decisions:10,decisionComputeLatenciesMs:Array(10).fill(2),modelCalls:0});
 const evaluate = (adapter,p={})=>evaluateCandidate({candidate,baseline,protocol:{...protocol,...p},adapter:{decisionPolicy,domainDependencies,...adapter},model,dependencies,baseReleaseDigest:'base',stage:'final'});
 test('paired statistics use independent seeds, not actions or opponents; Student t small-sample interval',async()=>{
  const report=await evaluate({id:'fixture',episode:async({strategy,seed})=>episode(strategy.version==='1'?0:seed)});
@@ -31,13 +32,13 @@ test('frozen knowledge is recursively immutable',async()=>{
  await assert.rejects(evaluate({id:'mutation',episode:async({knowledge})=>{knowledge.nested.count=1;return episode(0);}},{knowledgeStateMode:'frozen'}),TypeError);
 });
 test('group regression and excessive latency reject even profitable overall strategy',async()=>{
- const report=await evaluate({id:'fixture',episode:async({strategy,opponentId})=>({...episode(strategy.version==='1'?0:opponentId==='a'?20:-5),latenciesMs:Array(10).fill(200)})});
+ const report=await evaluate({id:'fixture',episode:async({strategy,opponentId})=>({...episode(strategy.version==='1'?0:opponentId==='a'?20:-5),decisionComputeLatenciesMs:Array(10).fill(200)})});
  assert.equal(report.status,'failed');
  assert.ok(report.reasons.includes('opponent_group_regression')); assert.ok(report.reasons.includes('latency_limit_exceeded'));
 });
 test('minimize metric reverses paired improvement; incomplete latency rejects',async()=>{
  assert.equal((await evaluate({id:'fixture',episode:async({strategy})=>episode(strategy.version==='1'?5:1)},{metric:{name:'cost',direction:'minimize',unit:'dollars'}})).status,'passed');
- await assert.rejects(evaluate({id:'bad',episode:async()=>({...episode(1),latenciesMs:[]})}),e=>e.code==='VALIDATION_REJECTED');
+ await assert.rejects(evaluate({id:'bad',episode:async()=>({...episode(1),decisionComputeLatenciesMs:[]})}),e=>e.code==='VALIDATION_REJECTED');
 });
 test('immutable protocol rejects duplicate seeds and multiple final attempts',()=>{
  assert.throws(()=>validateProtocol({...protocol,seeds:[1,1]}));
@@ -106,7 +107,7 @@ test('model failures cannot be hidden by an evaluator that returns a profitable 
  }
 });
 test('real evaluation rejects unmodeled decisions and legacy fallback protocol/results', async () => {
- await assert.rejects(evaluateCandidate({candidate,baseline,protocol,adapter:{id:'program-actions',decisionPolicy,domainDependencies,episode:async()=>episode(100)},model:{...model,kind:'real'},dependencies,baseReleaseDigest:'base',stage:'final'}), {code:'VALIDATION_REJECTED'});
+ await assert.rejects(evaluateCandidate({candidate,baseline,protocol,adapter:{id:'program-actions',decisionPolicy,domainDependencies,episode:async()=>episode(100)},model:{...model,kind:'real'},dependencies:{...dependencies,modelKind:'real',modelBehaviorDigest:modelBehaviorDigest({...model,kind:'real'})},baseReleaseDigest:'base',stage:'final'}), {code:'VALIDATION_REJECTED'});
  assert.throws(() => validateProtocol({...protocol, maxFallbackRate: 0}), {code:'CONFIG_INVALID'});
  await assert.rejects(evaluate({id:'legacy-result',episode:async()=>({...episode(100),fallbacks:0})}), {code:'VALIDATION_REJECTED'});
 });
@@ -128,4 +129,20 @@ test('public evaluation rejects legacy strategies before handing them to a custo
   await assert.rejects(evaluateCandidate({candidate,baseline,protocol,adapter,model,dependencies,baseReleaseDigest:'base',stage:'final',[field]:{...(field === 'candidate' ? candidate : baseline),schemaVersion:'1.0'}}), {code:'VERSION_INCOMPATIBLE'});
  }
  assert.equal(calls,0);
+});
+
+test('evaluation latency names describe decision computation and reject the old ambiguous gate', async () => {
+ const report = await evaluate({id:'compute-only',episode:async({strategy})=>episode(strategy.version==='2'?1:0)});
+ assert.equal(report.p95DecisionComputeMs,2);
+ assert.equal(Object.hasOwn(report,'p95LatencyMs'),false);
+ assert.throws(()=>validateProtocol({...protocol,version:'2.0'}),{code:'CONFIG_INVALID'});
+ assert.throws(()=>validateProtocol({...protocol,maxP95LatencyMs:100}),{code:'CONFIG_INVALID'});
+});
+test('matching model names do not authorize a different adapter behavior or model kind in evaluation', async () => {
+ let called=false;
+ const adapter={id:'identity',decisionPolicy,domainDependencies,async episode(){called=true;return episode(1);}};
+ for(const changed of [{...model,kind:'real'},{...model,behaviorIdentity:{...model.behaviorIdentity,adapterVersion:'changed'}}]) {
+  await assert.rejects(evaluateCandidate({candidate,baseline,protocol,adapter,model:changed,dependencies,baseReleaseDigest:'base',stage:'final'}),{code:'VERSION_INCOMPATIBLE'});
+ }
+ assert.equal(called,false);
 });

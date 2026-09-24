@@ -177,3 +177,16 @@ DUELLOOP_LIVE_RESEARCH_MODE=team node scripts/team-live.mjs --check
 每次实验最多 6 次研究调用、每次调用 16 turns、研究及其评价累计 1,000,000 tokens（不含研究前经验）、包含经验的总决策调用 200 次；这些是上限而非费用估算。计划规模为 12 步经验、最多 32 次开发决策调用和 96 次最终决策调用，共最多 140 次。可通过 `DUELLOOP_TEAM_MAX_TOKENS` 将预算显式设为最多 2,000,000 tokens，通过 `DUELLOOP_TEAM_MAX_TURNS` 显式设为最多 32 turns；默认值仍为 1,000,000 / 16。单模型与团队对照应使用相同设置，选择模式本身不会增加额度。其他 `DUELLOOP_TEAM_*` 变量可降低调用上限。
 
 结果保存到 `${mode}/${timestamp}/result.json`，包括角色会话、验证结论、耗时、调用量、token 和已知费用，未知费用会单独标记。实验固定为 `candidate_only`，不会激活候选。`no_change`、候选被拒绝或证据不足都可能是正确结果。两种模式各运行一次且使用独立保留集，只支持描述性比较本次结果及成本；不能据此宣称团队研究优于单模型，也不保证产生策略改进。
+
+
+## 历史规模与完整 SDK 工程基准
+
+```sh
+npm run benchmark:history -- --history 1000,10000,100000 --steps 300 --repetitions 2 --output ./artifacts/history-benchmark.json
+```
+
+该命令只调用离线 fixture。每个档位先写入对应数量的合成历史决策、执行意图和反馈，再比较独立快循环与同库的快照/开发评估并发。报告包含模型时延、决策端到端时延、执行回执时延、完整 `step()` P50/P95/P99、截止超出率、超时/停止率、内存和 SQLite 事务获取耗时；每个重复使用独立数据库，交替测量顺序。
+
+模型时延和运行时事件采用毫秒时钟；外层完整 `step()` 使用高精度单调时钟并覆盖遥测落库。`BEGIN IMMEDIATE` 计时包含语句开销与锁等待；线程的 RSS 是整个进程共享内存，堆内存才按 worker 分开。慢循环负载使用冻结快照和完整轨迹开发实验，不消耗保留集，也不调用付费 pi。
+
+评价协议 `3.0` 的 `maxP95DecisionComputeMs` 门禁只覆盖模拟器中的问题构造、模型调用与评分组合。它与完整 SDK 的 `decisionEndToEndLatencyMs`、`executionAckLatencyMs`、`stepLatencyMs` 不可互换。实际结果见[验证记录](validation.md)。

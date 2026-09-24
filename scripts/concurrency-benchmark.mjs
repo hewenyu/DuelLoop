@@ -28,7 +28,7 @@ function parse(args) {
 function measuredModel(options,role,store,scopeId) {
  const source=configuredModel(options.fixture),usage=usageAccumulator();let calls=0,budgetExhausted=false;
  const limit=role==='fast'?options.maxFastCalls:options.maxSlowCalls;
- const model={id:source.id,kind:source.kind,score:async input=>{
+ const model={id:source.id,kind:source.kind,behaviorIdentity:source.behaviorIdentity,score:async input=>{
   if(calls>=limit){budgetExhausted=true;throw new DuelLoopError('BUDGET_EXHAUSTED',`${role} model call budget exhausted`);}
   calls++;
   try {
@@ -79,7 +79,7 @@ async function workerMain() {
   const adapter=new KuhnEvaluationAdapter(policy),baseReleaseDigest=store.activeRelease('benchmark');
   const baseline=store.getArtifact(store.release(baseReleaseDigest).strategyDigest),candidate=structuredClone(baseline);
   candidate.version='benchmark-candidate';candidate.parentVersion=baseline.version;candidate.decision.defaultWeights.exposure=-.4;
-  const protocol={version:'2.0',id:'concurrent-development-workload',domainId:domain.id,seeds:[101,103],opponentIds:['calling','tight'],trajectoriesPerSeed:options.slowHands,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},minSamples:2,minimumImprovement:0,maxGroupRegression:1,confidenceLevel:.95,maxP95LatencyMs:options.timeoutMs,maxDevelopmentEvalRuns:options.slowRuns,maxFinalEvaluationsPerRun:1,holdoutId:'development-workload-not-release-evidence',maxHoldoutUses:1};
+  const protocol={version:'3.0',id:'concurrent-development-workload',domainId:domain.id,seeds:[101,103],opponentIds:['calling','tight'],trajectoriesPerSeed:options.slowHands,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},minSamples:2,minimumImprovement:0,maxGroupRegression:1,confidenceLevel:.95,maxP95DecisionComputeMs:options.timeoutMs,maxDevelopmentEvalRuns:options.slowRuns,maxFinalEvaluationsPerRun:1,holdoutId:'development-workload-not-release-evidence',maxHoldoutUses:1};
   const startedAt=now(),experiments=[];let failureCode=null;
   for(let index=0;index<options.slowRuns&&!Atomics.load(fastDone,0);index++) {
    const begin=now();

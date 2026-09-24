@@ -3,6 +3,7 @@ import { DuelLoopError, invariant } from './errors.js';
 import { digest, jsonValue, seededRandom, withDeadline } from './utils.js';
 import { buildQuestions, compileStrategy, evaluateAnswers } from './strategy.js';
 import { evaluateCandidate, validateProtocol } from './evaluation.js';
+import { modelBehaviorDigest } from './runtime.js';
 import type { BehaviorCase, BehaviorDependencies, CandidateSubmission, DecisionModel, DomainDefinition, DuelLoopStore, EvaluationAdapter, EvaluationProtocol, Json, ResearchProvider, ResearchRun, ResearchTool, RunStatus, StrategyPackage, ValidationReport } from './types.js';
 
 const textSchema: Record<string, Json> = {type:'string',minLength:1,maxLength:10000};
@@ -39,7 +40,7 @@ function submissionSchemas(run: ResearchRun, baseline: StrategyPackage): {strate
   return {strategy,fixture,submission};
 }
 
-const terminal = new Set<RunStatus>(['cancelled','no_change','budget_exhausted','completed_passed','completed_failed','completed_inconclusive','error']);
+const terminal = new Set<RunStatus>(['cancelled','no_change','budget_exhausted','completed_passed','completed_failed','completed_inconclusive','error','waiting_protocol']);
 export interface CandidateCheckPlan { changedSections: string[]; questionsChanged: boolean; requiresNewResponses: boolean; requiresRealModelEvaluation: boolean; behaviorCaseIds: string[] }
 export function candidateCheckPlan(base: StrategyPackage, candidate: StrategyPackage): CandidateCheckPlan {
   const changedSections = (Object.keys(candidate) as (keyof StrategyPackage)[]).filter(key=>digest(base[key] ?? null)!==digest(candidate[key] ?? null));
@@ -113,13 +114,27 @@ export class ResearchOrchestrator {
     for (const [key,value] of Object.entries(this.budget)) invariant(Number.isFinite(value) && Number.isSafeInteger(value) && value >= (key === 'maxRepairAttempts' ? 0 : 1), 'CONFIG_INVALID', `Invalid research budget ${key}`);
     this.maxRounds = options.maxRounds ?? 2;
     invariant(Number.isSafeInteger(this.maxRounds) && this.maxRounds > 0, 'CONFIG_INVALID', 'Invalid research round limit');
-    invariant(options.dependencies.model === options.model.id && options.domain.capabilities.evaluation, 'CONFIG_INVALID', 'Research requires matching evaluation model and domain capability');
+    invariant(options.dependencies.model === options.model.id && options.dependencies.modelKind === options.model.kind && options.dependencies.modelBehaviorDigest === modelBehaviorDigest(options.model) && options.domain.capabilities.evaluation, 'CONFIG_INVALID', 'Research requires matching evaluation model behavior and domain capability');
     if (options.mode === 'team') invariant(options.providers.adversary && options.providers.integrator, 'CONFIG_INVALID', 'Team mode requires all role providers');
   }
-  create(input: { id?: string; scopeId: string; protocol: EvaluationProtocol; developmentProtocol?: EvaluationProtocol; snapshotId?: string }): ResearchRun {
+  /** Resource preflight does not claim the final holdout or create a research run. */
+  protocolAvailability(input: EvaluationProtocol): {used:number;remaining:number} {
+    const protocol=validateProtocol(input);
+    invariant(protocol.domainId===this.options.domain.id,'CONFIG_INVALID','Protocol domain mismatch');
+    this.options.store.registerHoldout(protocol);
+    return this.options.store.holdoutAvailability(protocol.holdoutId,protocol.maxHoldoutUses);
+  }
+  private requireHoldout(protocol:EvaluationProtocol):void {
+    const availability=this.protocolAvailability(protocol);
+    invariant(availability.remaining>0,'HOLDOUT_UNAVAILABLE','Final evaluation resource exhausted; configure an independent new protocol before research',{holdoutId:protocol.holdoutId,...availability});
+  }
+  create(input: { id?: string; scopeId: string; protocol: EvaluationProtocol; developmentProtocol?: EvaluationProtocol; snapshotId?: string; snapshotOptions?:{maxDecisions?:number;maxFeedback?:number}; trigger?:{feedbackEventId:number;cutoff:number;settledTrajectories:number} }): ResearchRun {
     const { store, domain } = this.options;
+    if(input.trigger)invariant(Number.isSafeInteger(input.trigger.feedbackEventId)&&input.trigger.feedbackEventId>0&&Number.isFinite(input.trigger.cutoff)&&Number.isSafeInteger(input.trigger.settledTrajectories)&&input.trigger.settledTrajectories>0,'CONFIG_INVALID','Invalid research trigger cursor');
+    for(const limit of [input.snapshotOptions?.maxDecisions,input.snapshotOptions?.maxFeedback])invariant(limit===undefined||(Number.isSafeInteger(limit)&&limit>0&&limit<=10000),'CONFIG_INVALID','Snapshot limits must be positive integers up to 10000');
     const protocol = validateProtocol(input.protocol);
     invariant(protocol.domainId === domain.id, 'CONFIG_INVALID', 'Protocol domain mismatch');
+    this.requireHoldout(protocol);
     const baseReleaseDigest = store.activeRelease(input.scopeId);
     invariant(baseReleaseDigest, 'NOT_FOUND', 'Research requires an active baseline release');
     invariant(digest(store.release(baseReleaseDigest).dependencies) === digest(this.options.dependencies), 'VERSION_INCOMPATIBLE', 'Baseline behavior dependencies differ from experimental dependencies');
@@ -129,10 +144,10 @@ export class ResearchOrchestrator {
       invariant(development.domainId === domain.id && development.holdoutId !== protocol.holdoutId && !development.seeds.some(seed=>protocol.seeds.includes(seed)), 'CONFIG_INVALID', 'Development and holdout environments must be separate');
       developmentProtocolDigest = store.putArtifact('development_protocol',development);
     }
-    const researchSnapshotId = input.snapshotId ?? store.snapshot(input.scopeId,Date.now());
+    const researchSnapshotId = input.snapshotId ?? store.snapshot(input.scopeId,input.trigger?.cutoff??Date.now(),input.snapshotOptions);
     const snapshot = store.getArtifact<{ scopeId?: string }>(researchSnapshotId);
     invariant(snapshot.scopeId === input.scopeId, 'ACCESS_DENIED', 'Research snapshot does not belong to this scope');
-    return store.createRun({ id: input.id ?? randomUUID(), scopeId: input.scopeId, baseReleaseDigest, researchSnapshotId, evaluationProtocolDigest: store.putArtifact('evaluation_protocol',protocol,'private'), status: 'created', data: { developmentProtocolDigest, mode: this.options.mode ?? 'single', budget: jsonValue(this.budget), maxRounds: this.maxRounds } });
+    return store.createRun({ id: input.id ?? randomUUID(), scopeId: input.scopeId, baseReleaseDigest, researchSnapshotId, evaluationProtocolDigest: store.putArtifact('evaluation_protocol',protocol,'private'), status: 'created', data: { developmentProtocolDigest, mode: this.options.mode ?? 'single', budget: jsonValue(this.budget), maxRounds: this.maxRounds,...(input.trigger?{trigger:jsonValue(input.trigger)}:{}) } });
   }
   cancel(id: string): ResearchRun {
     const run = this.options.store.cancelRun(id);
@@ -167,13 +182,17 @@ export class ResearchOrchestrator {
     const deadline = initial.createdAt + this.budget.maxWallTimeSeconds*1000;
     const baseline = store.getArtifact<StrategyPackage>(store.release(initial.baseReleaseDigest).strategyDigest);
     const protocol = store.getArtifact<EvaluationProtocol>(initial.evaluationProtocolDigest,{allowPrivate:true});
+    if(this.protocolAvailability(protocol).remaining===0) {
+      const waiting=store.transitionRun(id,['created'],'waiting_protocol',{reason:'holdout_unavailable',requiresNewProtocol:true});
+      return {run:waiting};
+    }
     const snapshot = store.getArtifact<Json>(initial.researchSnapshotId);
     const evidence = collectEvidenceRefs(snapshot);
     // Claim outside the owner's cleanup catch: a losing worker must not fail the winner's run.
     store.transitionRun(id,['created'],'researching');
     this.controllers.set(id,controller);
     let outstandingProviderTokens=0,providerUsageUnknown=false,prechargedProviderTokens=0;
-    const budgetedModel: DecisionModel = { id: model.id, kind: model.kind, score: async request => {
+    const budgetedModel: DecisionModel = { id: model.id, kind: model.kind, behaviorIdentity:model.behaviorIdentity, score: async request => {
       try {
         const current = this.assertRunning(id);
         invariant(!providerUsageUnknown && (current.counters.tokens ?? 0)+outstandingProviderTokens < this.budget.maxTokensTotal,'BUDGET_EXHAUSTED','Joint research/evaluation token budget exhausted before model call');
@@ -215,7 +234,7 @@ export class ResearchOrchestrator {
       const tools: ResearchTool[] = [
         {name:'query_experience',description:'Browse the bound frozen research snapshot in small summary pages (default 5, maximum 20). Filter kind and use nextOffset to continue. Summaries are previews, not fixture input. Read one exact evidenceRef for the complete frozen record, optionally selecting fields such as observation, candidates and answers; questions are available explicitly when needed. Only returned evidenceRefs may support submission; no holdout data is accessible.',schema:experienceQuerySchema,execute:async(input)=>{this.assertRunning(id);return queryFrozenExperience(snapshot,initial.researchSnapshotId,input);}},
         {name:'read_strategy',description:'Read the bound baseline and public domain rules; no holdout data.',schema:{type:'object',properties:{},additionalProperties:false},execute:async()=>{this.assertRunning(id);return jsonValue({strategy:baseline,submissionContract:{schema:schemas.submission,fixtureSchema:schemas.fixture,assertionSchema,bindings:{researchRunId:id,baseReleaseDigest:initial.baseReleaseDigest,researchSnapshotId:initial.researchSnapshotId,evaluationProtocolDigest:initial.evaluationProtocolDigest},strategyBindings:{schemaVersion:'2.0',strategyId:baseline.strategyId,parentVersion:baseline.version,provenance:{researchRunId:id,snapshotId:initial.researchSnapshotId}},answerKeyTemplate:'{dimensionId}:{candidateId}',workflow:['Copy the full baseline strategy; choose your own supported modification and new string version. Set parentVersion and provenance from strategyBindings.','Browse query_experience summaries, then read an exact evidenceRef with fields [observation,candidates,answers] to obtain full development observations and legal actions. Define expected behavior and regression assertions using the declared operator schema.','Call register_behavior_fixture with candidate strategy, observation, candidates, exact-question answers and assertion. Copy its returned behaviorCase into the submission arrays.','Submit the full CandidateSubmission using bindings and exact evidenceRefs. Service-generated hashes remove any need to compute digests yourself.'],fixtureMeaning:'Hand-authored responses only check interpreter semantics; they do not establish real model quality.'},strategyLanguage:{unknownFields:'No undeclared fields are permitted in StrategyPackage or its objects.',versions:'schemaVersion, version, parentVersion and scope versions are strings. Choose a different version; keep strategyId, parentVersion, scope and provenance bindings as specified.',scoreDimension:{required:['id','type','forEach','instructions','criteria','normalization','semantics'],type:'score',forEach:'candidate',normalization:'divide_by_max_level',idPattern:'^[a-zA-Z0-9_-]+$',criteria:'2 through 10 nonempty, concrete grade descriptions. score is divided by criteria.length - 1.',semantics:{required:['target','horizon','continuation','overlap'],values:'Nonempty strings explaining objective, horizon, fixed continuation and intentional overlap.'}},decision:{required:['defaultWeights','branches','branchPolicy','aggregate','selection'],weights:'Every default and branch weight map must include exactly every question ID, with finite numeric values.',branchPolicy:'first_match',aggregate:'weighted_sum',branch:{required:['id','when','weights'],meaning:'Unique id; finite condition below; full weight map.'},selection:{argmax:{mode:'argmax',tieBreak:'domain_priority',temperature:'Omit this field entirely.'},softmax_sample:{mode:'softmax_sample',tieBreak:'domain_priority',temperature:'Required finite number in [0.000001, 1000000].'}}},conditions:{leaf:{required:['feature','op','value'],operators:['eq','gt','gte','lt','lte','in'],feature:'Known visible feature, or observation.isStale. Numeric comparisons require numeric features and values; in requires an array of compatible values.'},groups:['{all: [condition, ...]}','{any: [condition, ...]}','{not: condition}'],unknown:'Missing features remain unknown, including under not. Only true matches.'},modelAnswers:'Every action requires complete, valid model answers. Confidence is recorded, including zero; it never gates acceptance. Model failure stops execution without selecting an alternate action. Fixtures evaluate observation.isStale using observation.observedAt as their fixed clock, not the current wall clock.'},domain:{id:domain.id,rulesVersion:domain.rulesVersion,features:domain.features,context:domain.context}});}},
-        {name:'query_research_history',description:'Read scope-local development history only. Earlier results are not current validation.',schema:{type:'object',properties:{},additionalProperties:false},execute:async()=>{this.assertRunning(id);return jsonValue(store.events({scopeId:initial.scopeId}).filter(e=>['research.role_output','research.candidate_submitted','research.development_result'].includes(e.type)).slice(-100));}},
+        {name:'query_research_history',description:'Read scope-local development history only. Earlier results are not current validation.',schema:{type:'object',properties:{},additionalProperties:false},execute:async()=>{this.assertRunning(id);return jsonValue(store.events({scopeId:initial.scopeId,types:['research.role_output','research.candidate_submitted','research.development_result'],limit:100,descending:true}).reverse());}},
         {name:'run_development_eval',description:'Evaluate a complete candidate strategy on the fixed development protocol, consuming one development budget.',schema:{type:'object',properties:{strategy:schemas.strategy},required:['strategy'],additionalProperties:false},execute:async(input)=>{
           this.assertRunning(id);
           invariant(input && typeof input==='object' && 'strategy' in input, 'CONFIG_INVALID','Missing development strategy');
@@ -248,7 +267,7 @@ export class ResearchOrchestrator {
         }},
         {name:'submit_candidate',description:'Submit the full CandidateSubmission with hypothesis, snapshot evidence, fresh bound response fixtures, behavior assertions and regression cases. No arbitrary test code.',schema:schemas.submission,execute:async(input)=>submit(input)}
       ];
-      const publicGoal = {runId:id,scopeId:initial.scopeId,baseReleaseDigest:initial.baseReleaseDigest,researchSnapshotId:initial.researchSnapshotId,evaluationProtocolDigest:initial.evaluationProtocolDigest,metric:protocol.metric,minimumImprovement:protocol.minimumImprovement,maxGroupRegression:protocol.maxGroupRegression,maxP95LatencyMs:protocol.maxP95LatencyMs,budget:this.budget};
+      const publicGoal = {runId:id,scopeId:initial.scopeId,baseReleaseDigest:initial.baseReleaseDigest,researchSnapshotId:initial.researchSnapshotId,evaluationProtocolDigest:initial.evaluationProtocolDigest,metric:protocol.metric,minimumImprovement:protocol.minimumImprovement,maxGroupRegression:protocol.maxGroupRegression,maxP95DecisionComputeMs:protocol.maxP95DecisionComputeMs,budget:this.budget};
       for(let round=0;round<this.maxRounds;round++) {
         let reviseRequested = false;
         for(const role of ['researcher','adversary','integrator'] as const) {
@@ -261,6 +280,7 @@ export class ResearchOrchestrator {
             this.assertRunning(id);
             const spent = store.getRun(id).counters.tokens ?? 0;
             invariant(spent<this.budget.maxTokensTotal,'BUDGET_EXHAUSTED','Research token budget exhausted');
+            this.requireHoldout(protocol);
             const callNumber = store.consumeBudget(id,'modelCalls',this.budget.maxModelCalls);
             const counters=store.getRun(id).counters;
             const roundsRemaining=this.maxRounds-round-1;
@@ -359,7 +379,7 @@ export class ResearchOrchestrator {
       else if(!terminal.has(run.status)) {
         const reason = controller.signal.reason;
         const exhausted = (error instanceof DuelLoopError && ['BUDGET_EXHAUSTED','MODEL_TIMEOUT'].includes(error.code)) || (reason instanceof DuelLoopError && reason.code === 'BUDGET_EXHAUSTED');
-        store.transitionRun(id,[run.status],exhausted?'budget_exhausted':'error',{error:error instanceof Error?error.message:'Unknown research failure'});
+        store.transitionRun(id,[run.status],error instanceof DuelLoopError&&error.code==='HOLDOUT_UNAVAILABLE'?'waiting_protocol':exhausted?'budget_exhausted':'error',{error:error instanceof Error?error.message:'Unknown research failure',...(error instanceof DuelLoopError&&error.code==='HOLDOUT_UNAVAILABLE'?{reason:'holdout_unavailable',requiresNewProtocol:true}:{})});
       }
       store.appendEvent('research.ended',initial.scopeId,{runId:id,status:store.getRun(id).status,error:error instanceof DuelLoopError?error.code:'RESEARCH_FAILURE',usageUnknown:!knownTokenUsage(error instanceof DuelLoopError ? error.context.usage : undefined)});
       return result();

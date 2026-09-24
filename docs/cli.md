@@ -60,7 +60,7 @@ duelloop init --dir ./jev-app --domain kuhn --application jev-app --scope main
 }
 ```
 
-同时把 `runtime.mode` 改成 `simulation`。`jev-1.13.0` 是本项目已实测的固定版本，实际账号仍需有访问权限；不能使用 `latest`。如果返回的实际模型 ID 与绑定 ID 不一致，运行时拒绝继续使用该版本，需重新绑定和验证。可选 `baseURL` 只接受没有嵌入凭据的 HTTP(S) URL。`doctor` 只报告环境变量是否存在，既不验证远端认证，也不输出值。
+同时把 `runtime.mode` 改成 `simulation`。`jev-1.13.0` 是本项目已实测的固定版本，实际账号仍需有访问权限；不能使用 `latest`。如果返回的实际模型 ID 与绑定 ID 不一致，运行时拒绝继续使用该版本，需重新绑定和验证。可选 `baseURL` 只接受不含用户名、密码、query、fragment 的 HTTP(S) URL；`deploymentVersion` 可显式固定同名部署的行为版本。端点、超时和部署版本都参与行为绑定。 未显式传入端点时读取 `TYPESAFE_BASE_URL`，再采用官方 `https://api.typesafe.ai`；构造时将有效端点和默认 10000ms 客户端超时固定并纳入指纹。`doctor` 只报告环境变量是否存在，既不验证远端认证，也不输出值。
 
 已经运行过的离线应用，其当前发布绑定了 fixture 模型；只改模型和模式再使用原数据库会得到 `VERSION_INCOMPATIBLE`。独立的 `jev-app` 使用自己的数据库，在首次运行时绑定真实模型。此方法用于建立新的模拟应用，不用于重置已有研究的保留集配额；维护现有应用时保留历史并按新依赖重新验证。
 
@@ -72,6 +72,8 @@ node --env-file=.env dist/cli.js run --config ./jev-app/duelloop.json --steps 4
 ```
 
 第二条命令按真实模型配置发出付费请求。`DUELLOOP_LIVE` 是仓库实验脚本的开关，不是 SDK 或 CLI 的全局禁用开关；普通 CLI 是否调用模型由命令、运行模式和模型配置决定。
+
+CLI 创建的评价协议为 `3.0`：`maxP95DecisionComputeMs` 衡量模拟器中的决策计算，不表示真实 SDK 的端到端时限。完整运行性能需使用实际存储和环境单独测量。
 
 ## 接入自己的环境
 
@@ -116,7 +118,8 @@ node --env-file=.env dist/cli.js run --config ./jev-app/duelloop.json --steps 4
   "trigger": {
     "settledTrajectories": 1000,
     "cooldownMs": 300000,
-    "pollIntervalMs": 5000
+    "pollIntervalMs": 5000,
+    "snapshotOptions": { "maxDecisions": 1000, "maxFeedback": 1000 }
   }
 }
 ```
@@ -131,7 +134,7 @@ duelloop research-run --config ./my-app/duelloop.json --id study-001
 duelloop research-status --config ./my-app/duelloop.json --id study-001
 ```
 
-`research-create` 不调用模型，在任务开始时冻结快照与最终协议。`research-run` 会调用配置的真实 pi，候选实验也可能调用 Jev。模型提出 `no_change` 是合法结果。最终失败/证据不足也是有效实验结论，不会被自动修订成同一保留集上的无限重试。
+`research-create` 不调用模型，在任务开始时冻结有限证据窗口与最终协议；先检查最终资源可用性，耗尽返回 `HOLDOUT_UNAVAILABLE`。`snapshotOptions` 可选，每项 1—10000 条，默认各 1000 条。`research-run` 会调用配置的真实 pi，候选实验也可能调用 Jev。模型提出 `no_change` 是合法结果。最终失败/证据不足也是有效实验结论，不会被自动修订成同一保留集上的无限重试。持续 Worker 在资源用尽时记录 `waiting_protocol`，等待应用修改为独立的新协议并重启 Worker；不能只更换 holdout ID 复用种子或提高已注册额度。已创建任务若遭遇额度竞争，返回 `waiting_protocol`，需要基于新协议创建新任务。`status` 中的最后一条 Worker 状态带有时间戳，不表示进程当前仍在运行。
 
 模型 Token 用量依赖供应商返回值。框架限制输出 Token、模型/工具轮次、累计已报告 Token 与后续调用；本次请求的输入消耗只能返回后获知，因此不能承诺绝对账单上限。取消或传输错误可能留下未知费用，日志会明确标记。pi `costUsd` 根据锁定模型目录估算；Jev 只报告 Token，不伪造费用。
 
@@ -182,7 +185,7 @@ duelloop research-worker --config ./my-app/duelloop.json
 | `help` / `--help` | JSON 命令与选项清单 |
 | `version` / `--version` | JSON 包版本 |
 
-模型失败会使运行命令以错误退出，停止记录可通过 `explain` 查询；不会自动切换程序动作。修复原因并完成 `reconcile` 后，显式重新运行命令以创建新实例。配置 Schema 仍为 `1.0`；策略 Schema 和评价协议为 `2.0`。旧发布不能直接在运行时 `duelloop-runtime-3` 下继续使用，迁移要求见[运维说明](operations.md)。
+模型失败会使运行命令以错误退出，停止记录可通过 `explain` 查询；不会自动切换程序动作。修复原因并完成 `reconcile` 后，显式重新运行命令以创建新实例。配置 Schema 仍为 `1.0`；策略 Schema 为 `2.0`，评价协议为 `3.0`。旧发布不能直接在运行时 `duelloop-runtime-4` 下继续使用，迁移要求见[运维说明](operations.md)。
 
 数据库备份和清理属于整个数据库的维护操作，导出与业务查询则限定当前作用域。清理不会删除仍被事件、任务、发布、轨迹或执行记录引用的产物。使用新协议/新基线前保留相关实验的审计证据。
 
@@ -197,7 +200,7 @@ duelloop research-worker --config ./my-app/duelloop.json
 | `0` | 操作完成；`no_change` 也为合法完成 |
 | `1` | 存储、内部错误、失败的恢复/完整性结果或研究错误 |
 | `2` | 参数、配置、策略、版本兼容或能力错误 |
-| `3` | 冲突、状态过期、未知执行、访问拒绝或资源缺失 |
+| `3` | 冲突、状态过期、未知执行、访问拒绝、激活延期或等待新评价协议 |
 | `4` | 验证拒绝，实验失败或证据不足 |
 | `5` | 模型错误、超时或预算耗尽 |
 | `130` | 用户取消或收到终止信号 |

@@ -65,12 +65,15 @@ export interface ScoreAnswer { score: number; confidence: number; probabilities:
 export interface ModelUsage { inputTokens?: number; outputTokens?: number; costUsd?: number; unknown?: boolean }
 export interface DecisionModel {
   id: string; kind: 'real' | 'fixture';
+  /** Credential-free, explicit identity of all behavior-affecting adapter/deployment settings. */
+  behaviorIdentity: { adapterVersion: string; deploymentVersion: string; protocolVersion: string; configurationDigest: string };
   score(request: { state: Features; questions: ScoreQuestion[]; signal: AbortSignal }): Promise<{
     answers: Record<string, ScoreAnswer>; model: string; usage?: ModelUsage;
   }>;
 }
 export interface BehaviorDependencies {
-  model: string; runtime: string; rules: string; featureBuilder: string;
+  model: string; modelKind: 'real' | 'fixture'; modelBehaviorDigest: string;
+  runtime: string; rules: string; featureBuilder: string;
   knowledgeUpdater: string; continuationPolicy: string; contextDigest: string;
 }
 export interface ReleaseBinding {
@@ -85,11 +88,11 @@ export interface DecisionRecord {
   branchId?: string; questions: ScoreQuestion[]; answers: Record<string, ScoreAnswer>;
   utilities: Record<string, number>; probabilities: Record<string, number>;
   model?: string; modelKind?: 'real' | 'fixture'; usage?: ModelUsage;
-  startedAt: number; finishedAt: number; randomSeed?: string;
+  startedAt: number; finishedAt: number; randomSeed?: string; modelLatencyMs?: number;
 }
 export type RunStatus = 'created' | 'researching' | 'development_evaluating' | 'candidate_locked'
   | 'final_evaluating' | 'cancel_requested' | 'cancelled' | 'no_change' | 'budget_exhausted'
-  | 'completed_passed' | 'completed_failed' | 'completed_inconclusive' | 'error';
+  | 'completed_passed' | 'completed_failed' | 'completed_inconclusive' | 'error' | 'waiting_protocol';
 export interface ResearchRun {
   id: string; scopeId: string; baseReleaseDigest: string; researchSnapshotId: string;
   evaluationProtocolDigest: string; status: RunStatus; revision: number;
@@ -108,17 +111,18 @@ export interface CandidateSubmission {
   regressionCases: BehaviorCase[]; knownRisks: string[];
 }
 export interface EvaluationProtocol {
-  version: '2.0'; id: string; domainId: string; seeds: number[];
+  version: '3.0'; id: string; domainId: string; seeds: number[];
   opponentIds: string[]; trajectoriesPerSeed: number;
   knowledgeStateMode: 'frozen' | 'online_update'; initialKnowledge: Features;
   metric: { name: string; direction: 'maximize' | 'minimize'; unit: string };
   minSamples: number; minimumImprovement: number; maxGroupRegression: number;
-  confidenceLevel: number; maxP95LatencyMs: number;
+  /** Simulator question construction, model call and score combination; excludes SDK storage/execution. */
+  confidenceLevel: number; maxP95DecisionComputeMs: number;
   maxDevelopmentEvalRuns: number; maxFinalEvaluationsPerRun: number;
   holdoutId: string; maxHoldoutUses: number;
 }
 export interface EvaluationEpisode {
-  reward: number; decisions: number; latenciesMs: number[];
+  reward: number; decisions: number; decisionComputeLatenciesMs: number[];
   modelCalls: number; usage?: ModelUsage;
 }
 export interface DecisionPolicy {
@@ -129,7 +133,7 @@ export interface EvaluationAdapter {
   /** Policy actually executed by the evaluator; must match the release runtime binding. */
   readonly decisionPolicy: DecisionPolicy;
   /** Rules, feature/knowledge builders, continuation and context actually simulated. */
-  readonly domainDependencies: Omit<BehaviorDependencies, 'model' | 'runtime'>;
+  readonly domainDependencies: Omit<BehaviorDependencies, 'model' | 'modelKind' | 'modelBehaviorDigest' | 'runtime'>;
   episode(input: { strategy: StrategyPackage; model: DecisionModel; seed: number;
     opponentId: string; trajectories: number; knowledge: Features;
     knowledgeStateMode: 'frozen' | 'online_update'; signal: AbortSignal }): Promise<EvaluationEpisode>;
@@ -141,7 +145,7 @@ export interface ValidationReport {
   reasons: string[]; modelKind: 'real' | 'fixture'; stage: 'development' | 'final';
   sampleCount: number; meanDifference: number; lowerBound: number;
   groups: Record<string, { meanDifference: number; lowerBound: number }>;
-  p95LatencyMs: number; createdAt: number;
+  p95DecisionComputeMs: number; createdAt: number;
 }
 export interface ResearchTool { name: string; description: string; schema: Record<string, Json>; execute(input: unknown): Promise<Json> }
 export interface ResearchProvider {
@@ -170,12 +174,15 @@ export interface DuelLoopStore {
   getArtifact<T>(digest: string, options?: { allowPrivate?: boolean }): T;
   listArtifacts(kind?: string, allowPrivate?: boolean): Artifact[];
   appendEvent(type: string, scopeId: string, data: unknown, visibility?: 'public' | 'private'): JournalEvent;
-  events(options?: { scopeId?: string; afterId?: number; allowPrivate?: boolean }): JournalEvent[];
+  events(options?: { scopeId?: string; afterId?: number; allowPrivate?: boolean; types?: string[]; limit?: number; descending?: boolean }): JournalEvent[];
+  latestEvent(scopeId: string, type: string, options?: { allowPrivate?: boolean }): JournalEvent | undefined;
   registerRelease(binding: ReleaseBinding): string;
   activeRelease(scopeId: string): string | null;
   scopeStatus(scopeId: string, dependencies?: BehaviorDependencies): ScopeStatus;
   release(digest: string): ReleaseBinding;
   assertReleaseEligible(digest: string, dependencies: BehaviorDependencies): void;
+  assertUsableRelease(digest: string, options: { dependencies: BehaviorDependencies; executionMode: ExecutionMode }): void;
+  pendingReleases(scopeId: string): { digest: string; binding: ReleaseBinding }[];
   activate(digest: string, dependencies: BehaviorDependencies, options?: { explicit?: boolean }): void;
   rollback(scopeId: string, target: string, dependencies: BehaviorDependencies): void;
   setActivationMode(scopeId: string, mode: 'candidate_only' | 'automatic_after_validation' | 'explicit'): void;
@@ -185,12 +192,17 @@ export interface DuelLoopStore {
   createRun(run: Omit<ResearchRun, 'revision' | 'createdAt' | 'updatedAt' | 'counters'>): ResearchRun;
   getRun(id: string): ResearchRun;
   listRuns(scopeId?: string): ResearchRun[];
+  activeRun(scopeId: string): ResearchRun | undefined;
   transitionRun(id: string, expected: RunStatus[], next: RunStatus, data?: Record<string, Json>): ResearchRun;
   consumeBudget(id: string, counter: string, limit: number, amount?: number): number;
   cancelRun(id: string): ResearchRun;
   claimHoldout(id: string, runId: string, limit: number): void;
+  holdoutAvailability(id: string, limit: number): { used: number; remaining: number };
+  registerHoldout(protocol: EvaluationProtocol): void;
   recordFeedback(feedback: FeedbackEvent): void;
-  snapshot(scopeId: string, cutoff: number): string;
+  latestFeedback(scopeId: string, options?: { afterEventId?: number; cutoff?: number }): { eventId: number; feedback: FeedbackEvent }[];
+  feedbackProgress(scopeId: string, afterEventId: number): { eventId: number; receivedAt: number; settledTrajectories: number };
+  snapshot(scopeId: string, cutoff: number, options?: { maxDecisions?: number; maxFeedback?: number }): string;
   acquireOwner(scopeId: string, streamId: string, ownerId: string): string;
   releaseOwner(scopeId: string, streamId: string, ownerToken: string): void;
   assertOwner(scopeId: string, streamId: string, ownerToken: string): void;
@@ -198,5 +210,7 @@ export interface DuelLoopStore {
   saveIntent(intent: Intent): void;
   recordReceipt(receipt: ExecutionReceipt): void;
   intents(scopeId?: string): Intent[];
+  intent(decisionId: string): Intent | undefined;
+  unresolvedIntents(scopeId?: string, streamId?: string): Intent[];
   close(): void;
 }

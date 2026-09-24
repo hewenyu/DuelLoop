@@ -1,23 +1,24 @@
 import { invariant } from './errors.js';
 import { digest } from './utils.js';
 import { validateScoreAnswer, validateStrategy } from './strategy.js';
-import { decisionPolicyRuntimeVersion } from './runtime.js';
+import { decisionPolicyRuntimeVersion, modelBehaviorDigest } from './runtime.js';
 import type { BehaviorDependencies, DecisionModel, EvaluationAdapter, EvaluationEpisode, EvaluationProtocol, Features, StrategyPackage, ValidationReport } from './types.js';
 
 /** Validate the whole immutable experimental plan before research can begin. */
 export function validateProtocol(input: unknown): EvaluationProtocol {
   invariant(input && typeof input === 'object', 'CONFIG_INVALID', 'Evaluation protocol must be an object');
   const p = input as EvaluationProtocol;
-  invariant(p.version === '2.0' && typeof p.id === 'string' && !!p.id && typeof p.domainId === 'string' && !!p.domainId, 'CONFIG_INVALID', 'Invalid protocol identity');
+  invariant(p.version === '3.0' && typeof p.id === 'string' && !!p.id && typeof p.domainId === 'string' && !!p.domainId, 'CONFIG_INVALID', 'Invalid protocol identity');
   invariant(Array.isArray(p.seeds) && p.seeds.length > 0 && p.seeds.every(Number.isSafeInteger) && new Set(p.seeds).size === p.seeds.length, 'CONFIG_INVALID', 'Seeds must be distinct integers');
   invariant(Array.isArray(p.opponentIds) && p.opponentIds.length > 0 && p.opponentIds.every(x => typeof x === 'string' && !!x) && new Set(p.opponentIds).size === p.opponentIds.length, 'CONFIG_INVALID', 'Opponents must be distinct IDs');
   for (const key of ['trajectoriesPerSeed', 'minSamples', 'maxDevelopmentEvalRuns', 'maxFinalEvaluationsPerRun', 'maxHoldoutUses'] as const) invariant(Number.isSafeInteger(p[key]) && p[key] >= (key === 'maxDevelopmentEvalRuns' ? 0 : 1), 'CONFIG_INVALID', `Invalid ${key}`);
   invariant(p.minSamples >= 2 && p.maxFinalEvaluationsPerRun === 1, 'CONFIG_INVALID', 'At least two independent samples and exactly one final evaluation per run are required');
   invariant(['frozen', 'online_update'].includes(p.knowledgeStateMode) && p.initialKnowledge && typeof p.initialKnowledge === 'object' && !Array.isArray(p.initialKnowledge), 'CONFIG_INVALID', 'Invalid knowledge state');
   invariant(p.metric && ['maximize', 'minimize'].includes(p.metric.direction) && typeof p.metric.name === 'string' && !!p.metric.name && typeof p.metric.unit === 'string', 'CONFIG_INVALID', 'Invalid metric');
-  for (const key of ['minimumImprovement', 'maxGroupRegression', 'maxP95LatencyMs'] as const) invariant(Number.isFinite(p[key]) && p[key] >= 0, 'CONFIG_INVALID', `Invalid ${key}`);
+  for (const key of ['minimumImprovement', 'maxGroupRegression', 'maxP95DecisionComputeMs'] as const) invariant(Number.isFinite(p[key]) && p[key] >= 0, 'CONFIG_INVALID', `Invalid ${key}`);
   invariant(p.confidenceLevel > 0.5 && p.confidenceLevel < 1 && typeof p.holdoutId === 'string' && !!p.holdoutId, 'CONFIG_INVALID', 'Invalid confidence or holdout limits');
   invariant(!('maxFallbackRate' in p), 'CONFIG_INVALID', 'Fallback thresholds are not supported');
+  invariant(!('maxP95LatencyMs' in p), 'CONFIG_INVALID', 'Use maxP95DecisionComputeMs; SDK end-to-end latency needs a separate runtime benchmark');
   digest(p);
   return structuredClone(p);
 }
@@ -30,7 +31,7 @@ function validateEpisode(e: EvaluationEpisode): void {
   invariant(e && !('fallbacks' in e), 'VALIDATION_REJECTED', 'Legacy fallback experiment results are not accepted');
   invariant(e && Number.isFinite(e.reward), 'VALIDATION_REJECTED', 'Episode reward must be finite and settled');
   for (const key of ['decisions', 'modelCalls'] as const) invariant(Number.isSafeInteger(e[key]) && e[key] >= 0, 'VALIDATION_REJECTED', `Invalid episode ${key}`);
-  invariant(Array.isArray(e.latenciesMs) && e.latenciesMs.length === e.decisions && e.latenciesMs.every(x => Number.isFinite(x) && x >= 0), 'VALIDATION_REJECTED', 'Episode latency data are incomplete');
+  invariant(Array.isArray(e.decisionComputeLatenciesMs) && e.decisionComputeLatenciesMs.length === e.decisions && e.decisionComputeLatenciesMs.every(x => Number.isFinite(x) && x >= 0), 'VALIDATION_REJECTED', 'Episode latency data are incomplete');
 }
 // Student-t two-sided interval, evaluated numerically; no normal approximation for tiny samples.
 function logGamma(z: number): number {
@@ -95,12 +96,12 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
   validateStrategy(candidate); validateStrategy(baseline);
   const protocol = validateProtocol(options.protocol);
   invariant(candidate.scope.domain === protocol.domainId && baseline.scope.domain === protocol.domainId, 'CONFIG_INVALID', 'Protocol and strategy domains differ');
-  invariant(model.id === dependencies.model, 'VERSION_INCOMPATIBLE', 'Evaluation model does not match behavior dependencies');
+  invariant(model.id === dependencies.model && model.kind === dependencies.modelKind && modelBehaviorDigest(model) === dependencies.modelBehaviorDigest, 'VERSION_INCOMPATIBLE', 'Evaluation model behavior does not match behavior dependencies');
   invariant(adapter.decisionPolicy && typeof adapter.decisionPolicy === 'object', 'VERSION_INCOMPATIBLE', 'Evaluation adapter must declare its actual decision policy');
   invariant(Number.isFinite(adapter.decisionPolicy.maxDecisionMs) && adapter.decisionPolicy.maxDecisionMs > 0 && Number.isFinite(adapter.decisionPolicy.executionReserveMs) && adapter.decisionPolicy.executionReserveMs >= 0 && adapter.decisionPolicy.executionReserveMs < adapter.decisionPolicy.maxDecisionMs && (adapter.decisionPolicy.randomSeed === undefined || typeof adapter.decisionPolicy.randomSeed === 'string'), 'VERSION_INCOMPATIBLE', 'Evaluation adapter decision policy is incomplete or invalid');
   invariant(decisionPolicyRuntimeVersion(adapter.decisionPolicy) === dependencies.runtime, 'VERSION_INCOMPATIBLE', 'Evaluation decision deadline, execution reserve or random seed differs from runtime binding');
   invariant(adapter.domainDependencies && typeof adapter.domainDependencies === 'object', 'VERSION_INCOMPATIBLE', 'Evaluation adapter must declare the domain behavior dependencies it actually simulates');
-  const { model: _modelBinding, runtime: _runtimeBinding, ...domainBinding } = dependencies;
+  const { model: _modelBinding, modelKind: _modelKind, modelBehaviorDigest: _modelBehavior, runtime: _runtimeBinding, ...domainBinding } = dependencies;
   invariant(digest(adapter.domainDependencies) === digest(domainBinding), 'VERSION_INCOMPATIBLE', 'Evaluation domain rules, features, knowledge updater, continuation or context differ from release binding');
   const signal = options.signal ?? new AbortController().signal;
   const evidence: EvaluationEvidence = { adapterId: adapter.id, protocolDigest: digest(protocol), modelKind: model.kind, blocks: [], costs: { modelCalls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, usageUnknown: false } };
@@ -118,7 +119,7 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
         let calls = 0, completed = 0, pending = 0, modelFailed = false;
         let firstModelFailure: unknown;
         const checkedModel: DecisionModel = {
-          id: model.id, kind: model.kind,
+          id: model.id, kind: model.kind, behaviorIdentity: model.behaviorIdentity,
           async score(request) {
             if (modelFailed) throw firstModelFailure;
             calls++; pending++;
@@ -165,17 +166,17 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
       }
       block.push(difference);
       const group = byOpponent.get(opponentId) ?? []; group.push(difference); byOpponent.set(opponentId,group);
-      decisions += b.decisions; latencies.push(...b.latenciesMs);
+      decisions += b.decisions; latencies.push(...b.decisionComputeLatenciesMs);
     }
     paired.push(block.reduce((a,b)=>a+b,0)/block.length);
   }
   for (const [opponent, values] of byOpponent) groups[opponent] = interval(values, protocol.confidenceLevel);
   const overall = interval(paired, protocol.confidenceLevel);
   latencies.sort((a,b)=>a-b);
-  const p95LatencyMs = latencies.length ? latencies[Math.ceil(latencies.length*.95)-1]! : 0;
+  const p95DecisionComputeMs = latencies.length ? latencies[Math.ceil(latencies.length*.95)-1]! : 0;
   const reasons: string[] = [];
   let failed = false;
-  if (p95LatencyMs > protocol.maxP95LatencyMs) { failed = true; reasons.push('latency_limit_exceeded'); }
+  if (p95DecisionComputeMs > protocol.maxP95DecisionComputeMs) { failed = true; reasons.push('latency_limit_exceeded'); }
   if (Object.values(groups).some(g => g.meanDifference < -protocol.maxGroupRegression)) { failed = true; reasons.push('opponent_group_regression'); }
   if (overall.meanDifference < 0) { failed = true; reasons.push('negative_mean_improvement'); }
   let insufficient = paired.length < protocol.minSamples || decisions === 0;
@@ -184,5 +185,5 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
   if (overall.lowerBound <= protocol.minimumImprovement) { insufficient = true; reasons.push('improvement_not_demonstrated'); }
   if (Object.values(groups).some(g=>g.lowerBound < -protocol.maxGroupRegression)) { insufficient = true; reasons.push('group_non_regression_not_demonstrated'); }
   options.onEvidence?.(structuredClone(evidence));
-  return { evaluationAdapterId: adapter.id, candidateDigest: digest(candidate), baseReleaseDigest, protocolDigest: digest(protocol), dependencies: structuredClone(dependencies), status: failed ? 'failed' : insufficient ? 'inconclusive' : 'passed', reasons, modelKind: model.kind, stage, sampleCount: paired.length, ...overall, groups, p95LatencyMs, createdAt: Date.now() };
+  return { evaluationAdapterId: adapter.id, candidateDigest: digest(candidate), baseReleaseDigest, protocolDigest: digest(protocol), dependencies: structuredClone(dependencies), status: failed ? 'failed' : insufficient ? 'inconclusive' : 'passed', reasons, modelKind: model.kind, stage, sampleCount: paired.length, ...overall, groups, p95DecisionComputeMs, createdAt: Date.now() };
 }

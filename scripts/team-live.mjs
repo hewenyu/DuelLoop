@@ -34,7 +34,7 @@ async function main() {
  const decisionUsage=usageAccumulator(),researchUsage=usageAccumulator();
  let decisionCalls=0,orchestrator,runId;
  const roleRuns=[];
- const model={id:source.id,kind:source.kind,score:async input=>{
+ const model={id:source.id,kind:source.kind,behaviorIdentity:source.behaviorIdentity,score:async input=>{
   if(controller.signal.aborted)throw new DuelLoopError('CANCELLED','Team experiment cancelled');
   if(decisionCalls>=configuration.maxDecisionCalls)throw new DuelLoopError('BUDGET_EXHAUSTED','Team decision-call budget exhausted');
   decisionCalls++;
@@ -59,7 +59,7 @@ async function main() {
  }};
  const baseline=createKuhnStrategy();
  // This is the ordinary illustrative baseline, not the deliberately reversed R2 capability fixture.
- const protocol={version:'2.0',id:`normal-${researchMode}-final-v1`,domainId:domain.id,seeds:holdout.seeds,opponentIds:['calling','tight','random'],trajectoriesPerSeed:2,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},minSamples:4,minimumImprovement:.01,maxGroupRegression:.5,confidenceLevel:.95,maxP95LatencyMs:configuration.decisionMs,maxDevelopmentEvalRuns:1,maxFinalEvaluationsPerRun:1,holdoutId:holdout.id,maxHoldoutUses:1};
+ const protocol={version:'3.0',id:`normal-${researchMode}-final-v1`,domainId:domain.id,seeds:holdout.seeds,opponentIds:['calling','tight','random'],trajectoriesPerSeed:2,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},minSamples:4,minimumImprovement:.01,maxGroupRegression:.5,confidenceLevel:.95,maxP95DecisionComputeMs:configuration.decisionMs,maxDevelopmentEvalRuns:1,maxFinalEvaluationsPerRun:1,holdoutId:holdout.id,maxHoldoutUses:1};
  const developmentProtocol={...protocol,id:'normal-shared-development-v1',seeds:[131,137],opponentIds:['calling','tight'],minSamples:2,holdoutId:'normal-shared-development-only-v1'};
  const summary={schemaVersion:'2.0',experiment:researchMode==='team'?'same-model-three-isolated-team-roles':'single-model-shared-session-three-phases',status:'started',mode:check?'offline_interface_check':'real_research_experiment',researchMode,comparisonPlan,comparisonPlanDigest:digest(comparisonPlan),decisionModelKind:model.kind,researchProviderKind:provider.kind,models:{decision:model.id,research:provider.id},configuration,
   initialStrategyDigest:digest(baseline),

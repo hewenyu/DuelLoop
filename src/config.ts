@@ -11,12 +11,12 @@ export interface DuelLoopConfiguration {
   storage?: { maxDatabaseBytes?: number; maxArtifactBytes?: number };
   domain: { kind: 'kuhn' | 'auction'; seed: number; opponentId: string; knowledgeStateMode: 'frozen' | 'online_update'; initialKnowledge: Features }
     | { kind: 'module'; path: string; exportName: string; options: Features };
-  decisionModel: { kind: 'fixture'; id: string } | { kind: 'jev'; model: string; apiKeyEnv: string; timeoutMs: number; baseURL?: string };
+  decisionModel: { kind: 'fixture'; id: string } | { kind: 'jev'; model: string; apiKeyEnv: string; timeoutMs: number; baseURL?: string; deploymentVersion?: string };
   runtime: { mode: ExecutionMode; executionOwner: 'framework' | 'host'; streamIds: string[]; maxSteps: number; intervalMs: number; maxDecisionMs: number; executionReserveMs: number };
   activationMode: 'candidate_only' | 'automatic_after_validation' | 'explicit';
   evaluation: { developmentProtocol: string; finalProtocol: string; timeoutMs: number; maxModelCalls: number };
   research: { mode: 'off' } | { mode: 'single' | 'team'; maxRounds: number; budget: ResearchBudget;
-    trigger?: { settledTrajectories: number; cooldownMs: number; pollIntervalMs: number };
+    trigger?: { settledTrajectories: number; cooldownMs: number; pollIntervalMs: number; snapshotOptions?: { maxDecisions?: number; maxFeedback?: number } };
     roles: { researcher: PiRoleConfiguration; adversary?: PiRoleConfiguration; integrator?: PiRoleConfiguration } };
 }
 function object(value: unknown, allowed: string[], path: string): asserts value is Record<string, any> {
@@ -70,7 +70,8 @@ export function validateConfiguration(input: unknown): DuelLoopConfiguration {
   invariant(m && ['fixture','jev'].includes(m.kind), 'CONFIG_INVALID', 'Unsupported decision model kind');
   if (m.kind === 'fixture') { object(m, ['kind','id'], 'decisionModel'); string(m.id, 'decisionModel.id'); }
   else {
-    object(m, ['kind','model','apiKeyEnv','timeoutMs','baseURL'], 'decisionModel'); string(m.model, 'decisionModel.model');
+    object(m, ['kind','model','apiKeyEnv','timeoutMs','baseURL','deploymentVersion'], 'decisionModel'); string(m.model, 'decisionModel.model');
+    if (m.deploymentVersion !== undefined) string(m.deploymentVersion, 'decisionModel.deploymentVersion');
     invariant(!/latest/i.test(m.model), 'CONFIG_INVALID', 'Application releases require a pinned Jev model ID, not latest');
     environment(m.apiKeyEnv, 'decisionModel.apiKeyEnv'); integer(m.timeoutMs, 1, 'decisionModel.timeoutMs'); url(m.baseURL, 'decisionModel.baseURL');
   }
@@ -96,7 +97,14 @@ export function validateConfiguration(input: unknown): DuelLoopConfiguration {
   else {
     object(research, ['mode','maxRounds','budget','roles','trigger'], 'research'); integer(research.maxRounds, 1, 'research.maxRounds');
     if (research.trigger !== undefined) {
-      object(research.trigger, ['settledTrajectories','cooldownMs','pollIntervalMs'], 'research.trigger');
+      object(research.trigger, ['settledTrajectories','cooldownMs','pollIntervalMs','snapshotOptions'], 'research.trigger');
+      if (research.trigger.snapshotOptions !== undefined) {
+        object(research.trigger.snapshotOptions, ['maxDecisions','maxFeedback'], 'research.trigger.snapshotOptions');
+        for (const key of ['maxDecisions','maxFeedback']) if (research.trigger.snapshotOptions[key] !== undefined) {
+          integer(research.trigger.snapshotOptions[key], 1, `research.trigger.snapshotOptions.${key}`);
+          invariant(research.trigger.snapshotOptions[key] <= 10000, 'CONFIG_INVALID', 'Snapshot record limits must be <= 10000');
+        }
+      }
       integer(research.trigger.settledTrajectories, 1, 'research.trigger.settledTrajectories');
       integer(research.trigger.cooldownMs, 0, 'research.trigger.cooldownMs');
       integer(research.trigger.pollIntervalMs, 10, 'research.trigger.pollIntervalMs');

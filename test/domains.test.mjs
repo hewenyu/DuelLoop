@@ -58,7 +58,7 @@ test('Cross application and actor observations are rejected', async () => {
   await assert.rejects(domain.candidates({ ...observation, applicationId: 'b' }), { code: 'ACCESS_DENIED' });
   await assert.rejects(domain.candidates({ ...observation, actorId: 'opponent' }), { code: 'ACCESS_DENIED' });
 });
-const model = { id: 'explicit-test-fixture', kind: 'fixture', async score({ questions }) {
+const model = { id: 'explicit-test-fixture', kind: 'fixture', behaviorIdentity:{adapterVersion:'domain-test-1',deploymentVersion:'fixture-1',protocolVersion:'score-1',configurationDigest:'fixture'}, async score({ questions }) {
   return { model: this.id, answers: Object.fromEntries(questions.map(q => [q.id, { score: q.dimensionId === 'gain' ? (['bet', 'call', 'bid-2'].includes(q.actionId) ? 4 : 2) : 1, confidence: 1, probabilities: { '0': 0, '1': 0, '2': 0, '3': 0, '4': 1 } }])) };
 } };
 for (const [Adapter, strategy, opponent] of [[KuhnEvaluationAdapter, createKuhnStrategy, 'calling'], [AuctionEvaluationAdapter, createAuctionStrategy, 'adaptive']]) {

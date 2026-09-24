@@ -40,7 +40,7 @@ test('LIVE R2: autonomous pi proposal → independent real-Jev evaluation → re
  const maxDecisionMs=decisionMs;
  const rawModel=new JevDecisionModel({model:process.env.DUELLOOP_JEV_MODEL,apiKeyEnv:keyEnv,baseURL:process.env.DUELLOOP_JEV_BASE_URL,timeoutMs:maxDecisionMs});
  let decisionCalls=0;
- const model={id:rawModel.id,kind:'real',score:async input=>{
+ const model={id:rawModel.id,kind:'real',behaviorIdentity:rawModel.behaviorIdentity,score:async input=>{
   if(t.signal.aborted)throw new DuelLoopError('CANCELLED','Live acceptance cancelled');
   if(decisionCalls>=maxDecisionCalls)throw new DuelLoopError('BUDGET_EXHAUSTED','Real decision call budget exhausted');
   decisionCalls++;
@@ -83,11 +83,11 @@ test('LIVE R2: autonomous pi proposal → independent real-Jev evaluation → re
    assert.equal(receipt?.status,'completed','Evidence collection must execute and settle real simulated actions');
   }
   assert.ok(before.some(d=>d.decisionSource==='strategy'&&d.modelKind==='real'),'No real Jev decisions available for research');
-  const protocol={version:'2.0',id:initialPolicyKind==='passive'?'controlled-passive-final-v1':'controlled-final-v1',domainId:domain.id,
+  const protocol={version:'3.0',id:initialPolicyKind==='passive'?'controlled-passive-final-v1':'controlled-final-v1',domainId:domain.id,
    seeds:[1009,2003,3001,4001,5003,6007],opponentIds:['calling','tight','random'],
    trajectoriesPerSeed:handsPerSeed,
    knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},
-   minSamples:6,minimumImprovement:0,maxGroupRegression:.5,confidenceLevel:.95,maxP95LatencyMs:maxDecisionMs,
+   minSamples:6,minimumImprovement:0,maxGroupRegression:.5,confidenceLevel:.95,maxP95DecisionComputeMs:maxDecisionMs,
    maxDevelopmentEvalRuns:2,maxFinalEvaluationsPerRun:1,holdoutId:'controlled-independent-holdout-v1',maxHoldoutUses:1};
   const developmentProtocol={...protocol,id:initialPolicyKind==='passive'?'controlled-passive-development-v1':'controlled-development-v1',seeds:[31,73,113],minSamples:3,opponentIds:['calling','tight'],holdoutId:'controlled-development-only'};
   orchestrator=new ResearchOrchestrator({store,domain,model,evaluator:new KuhnEvaluationAdapter({maxDecisionMs,executionReserveMs:100,randomSeed:'r2-controlled-v1'}),dependencies:runtime.dependencies,providers:{researcher:abortableProvider},mode:'single',maxRounds:2,budget:{maxWallTimeSeconds:researchSeconds,maxTokensTotal:maxTokens,maxModelCalls:8,maxDecisionModelCalls:maxDecisionCalls,maxRepairAttempts:1}});

@@ -233,7 +233,7 @@ async function simulate(factory: (options: SimulationOptions) => DomainDefinitio
     knowledge: structuredClone(input.knowledge), knowledgeStateMode: input.knowledgeStateMode, decisionTimeoutMs: maxDecisionMs, sessionId: `evaluation:${input.seed}` });
   const strategy = compileStrategy(input.strategy, domain).strategy;
   const random = seededRandom(`${input.seed}:selection`);
-  const result: EvaluationEpisode = { reward: 0, decisions: 0, latenciesMs: [], modelCalls: 0, usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 } };
+  const result: EvaluationEpisode = { reward: 0, decisions: 0, decisionComputeLatenciesMs: [], modelCalls: 0, usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 } };
   const settled = new Set<string>();
   // Every call constructs independent domain/opponent/knowledge state, including paired baseline/candidate calls.
   while (settled.size < input.trajectories) {
@@ -249,7 +249,7 @@ async function simulate(factory: (options: SimulationOptions) => DomainDefinitio
     } else result.usage!.unknown = true;
     const action = evaluateAnswers(strategy, observation, candidates, response.answers, timing.randomSeed === undefined ? random : seededRandom(`${timing.randomSeed}:${observation.trajectoryId}:${observation.revision}`)).action;
     invariant(!input.signal.aborted, 'CANCELLED', 'Evaluation cancelled');
-    result.decisions++; result.latenciesMs.push(Date.now() - started);
+    result.decisions++; result.decisionComputeLatenciesMs.push(Date.now() - started);
     const decisionId = `eval:${input.seed}:${result.decisions}`;
     const receipt = await domain.execute!({ decisionId, idempotencyKey: decisionId, expectedStateRevision: observation.revision, observation, action, deadline: observation.deadline });
     invariant(receipt.status === 'completed', 'EXECUTION_UNKNOWN', 'Evaluation action did not complete');

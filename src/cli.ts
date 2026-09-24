@@ -8,7 +8,7 @@ import { DuelLoopError, invariant } from './errors.js';
 import { loadConfiguration, readJsonFile, type DuelLoopConfiguration } from './config.js';
 import { SqliteStore } from './storage.js';
 import { DuelLoop } from './runtime.js';
-import { JevDecisionModel, FixtureDecisionModel, PiResearchProvider } from './adapters.js';
+import { JevDecisionModel, FixtureDecisionModel, PiResearchProvider, jevBehaviorIdentity } from './adapters.js';
 import { AuctionDomain, KuhnPokerDomain, AuctionEvaluationAdapter, KuhnEvaluationAdapter, createAuctionStrategy, createKuhnStrategy } from './domains.js';
 import { validateStrategy, compileStrategy, diffStrategies } from './strategy.js';
 import { validateProtocol, evaluateCandidate } from './evaluation.js';
@@ -45,11 +45,11 @@ async function writableJson(path: string, value: unknown): Promise<void> {
   catch { throw new DuelLoopError('CONFLICT', 'Cannot create output file; an existing file is never overwritten', { path }); }
 }
 function starterProtocol(domainId: string, stage: 'development' | 'final'): EvaluationProtocol {
-  return { version: '2.0', id: `${domainId}-${stage}-v2`, domainId, seeds: stage === 'development' ? [1,2,3,4] : [101,102,103,104],
+  return { version: '3.0', id: `${domainId}-${stage}-v2`, domainId, seeds: stage === 'development' ? [1,2,3,4] : [101,102,103,104],
     opponentIds: domainId === 'kuhn-poker' ? ['calling','tight'] : ['fixed','random'], trajectoriesPerSeed: 12,
     knowledgeStateMode: 'frozen', initialKnowledge: {}, metric: { name: 'reward', direction: 'maximize', unit: domainId === 'kuhn-poker' ? 'chips/hand' : 'credits/checkpoint' },
     minSamples: 4, minimumImprovement: 0.01, maxGroupRegression: 0.1, confidenceLevel: 0.95,
-    maxP95LatencyMs: 5000, maxDevelopmentEvalRuns: 6, maxFinalEvaluationsPerRun: 1, holdoutId: `${domainId}-${stage}-${randomUUID()}`, maxHoldoutUses: 1 };
+    maxP95DecisionComputeMs: 5000, maxDevelopmentEvalRuns: 6, maxFinalEvaluationsPerRun: 1, holdoutId: `${domainId}-${stage}-${randomUUID()}`, maxHoldoutUses: 1 };
 }
 async function initialize(flags: Record<string, string>) {
   const path = resolve(required(flags, 'dir')), kind = required(flags, 'domain');
@@ -89,7 +89,7 @@ async function domainFor(config: DuelLoopConfiguration): Promise<{ domain: Domai
 function modelFor(config: DuelLoopConfiguration, callable: boolean): DecisionModel {
   const settings = config.decisionModel;
   if (settings.kind === 'jev') {
-    if (!callable) return { id: settings.model, kind: 'real', score: async () => { throw new DuelLoopError('ACCESS_DENIED', 'Model calls disabled for this command'); } };
+    if (!callable) return { id: settings.model, kind: 'real', behaviorIdentity: jevBehaviorIdentity(settings), score: async () => { throw new DuelLoopError('ACCESS_DENIED', 'Model calls disabled for this command'); } };
     return new JevDecisionModel(settings);
   }
   return new FixtureDecisionModel(settings.id, (question, state) => {
@@ -155,8 +155,10 @@ export async function executeCli(argv: string[], options: { signal?: AbortSignal
   try {
     store.bindScope(config.scopeId, config.applicationId);
     if (command === 'status') {
+      const workerState = store.latestEvent(config.scopeId, 'research.worker_state', { allowPrivate: true });
       return { applicationId: config.applicationId, mode: config.runtime.mode, ...store.scopeStatus(config.scopeId),
-        runs: store.listRuns(config.scopeId), unresolvedExecutions: store.intents(config.scopeId).filter(i => !i.receipt || ['accepted','unknown'].includes(i.receipt.status)).map(i => ({ decisionId: i.decisionId, status: i.receipt?.status ?? 'unknown' })) };
+        lastReportedWorkerState: workerState ? { timestamp: workerState.timestamp, state: workerState.data } : null,
+        runs: store.listRuns(config.scopeId), unresolvedExecutions: store.unresolvedIntents(config.scopeId).map(i => ({ decisionId: i.decisionId, status: i.receipt?.status ?? 'unknown' })) };
     }
     if (command === 'integrity') return store.integrity();
     if (command === 'cleanup') return store.pruneUnreferencedArtifacts({ dryRun: flags.apply !== 'true' });
@@ -216,7 +218,7 @@ export async function executeCli(argv: string[], options: { signal?: AbortSignal
       const protocol = validateProtocol(await readJsonFile(config.evaluation.developmentProtocol)); let calls = 0; let exhausted = false;
       const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), config.evaluation.timeoutMs);
       const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
-      const bounded: DecisionModel = { id: model.id, kind: model.kind, score: async request => { if (++calls > config.evaluation.maxModelCalls) { exhausted = true; controller.abort(); throw new DuelLoopError('BUDGET_EXHAUSTED', 'Development model-call budget exhausted'); } return model.score(request); } };
+      const bounded: DecisionModel = { id: model.id, kind: model.kind, behaviorIdentity: model.behaviorIdentity, score: async request => { if (++calls > config.evaluation.maxModelCalls) { exhausted = true; controller.abort(); throw new DuelLoopError('BUDGET_EXHAUSTED', 'Development model-call budget exhausted'); } return model.score(request); } };
       try {
         const report = await evaluateCandidate({ candidate, baseline, protocol, adapter: evaluator, model: bounded, dependencies: runtime.dependencies, baseReleaseDigest: active, stage: 'development', signal });
         const reportDigest = store.putArtifact('development_report', report); store.appendEvent('evaluation.development', config.scopeId, { reportDigest, modelCalls: calls });
@@ -234,12 +236,12 @@ export async function executeCli(argv: string[], options: { signal?: AbortSignal
     for (const [name, settings] of Object.entries(config.research.roles)) { const provider = new PiResearchProvider(settings); providers.push(provider); roleProviders[name as keyof typeof roleProviders] = provider; }
     const orchestrator = new ResearchOrchestrator({ store, domain, model, evaluator, dependencies: runtime.dependencies,
       providers: roleProviders, mode: config.research.mode, budget: config.research.budget, maxRounds: config.research.maxRounds });
-    if (command === 'research-create') { const p = await protocols(config); return orchestrator.create({ scopeId: config.scopeId, ...(flags.id ? { id: flags.id } : {}), protocol: p.final, developmentProtocol: p.development }); }
+    if (command === 'research-create') { const p = await protocols(config); return orchestrator.create({ scopeId: config.scopeId, ...(flags.id ? { id: flags.id } : {}), protocol: p.final, developmentProtocol: p.development, snapshotOptions: config.research.trigger?.snapshotOptions }); }
     if (command === 'research-worker') {
       invariant(config.research.trigger, 'CONFIG_INVALID', 'research-worker requires an explicit trigger configuration');
       const p = await protocols(config); const { ResearchWorker } = await import('./worker.js');
       const worker = new ResearchWorker({ orchestrator, store, scopeId: config.scopeId, protocol: p.final, developmentProtocol: p.development,
-        settledTrajectories: config.research.trigger.settledTrajectories, cooldownMs: config.research.trigger.cooldownMs });
+        settledTrajectories: config.research.trigger.settledTrajectories, cooldownMs: config.research.trigger.cooldownMs, snapshotOptions: config.research.trigger.snapshotOptions });
       await worker.run({ signal: options.signal, pollIntervalMs: config.research.trigger.pollIntervalMs });
       return { stopped: true, scopeId: config.scopeId };
     }
@@ -260,7 +262,7 @@ export function cliExitCode(error: unknown): number {
   if (!(error instanceof DuelLoopError)) return 1;
   if (error.code === 'CANCELLED') return 130;
   if (['CONFIG_INVALID','STRATEGY_INVALID','VERSION_INCOMPATIBLE','CAPABILITY_UNSUPPORTED'].includes(error.code)) return 2;
-  if (['CONFLICT','STATE_STALE','EXECUTION_UNKNOWN','ACCESS_DENIED','NOT_FOUND'].includes(error.code)) return 3;
+  if (['CONFLICT','STATE_STALE','EXECUTION_UNKNOWN','ACCESS_DENIED','NOT_FOUND','ACTIVATION_DEFERRED','HOLDOUT_UNAVAILABLE'].includes(error.code)) return 3;
   if (error.code === 'VALIDATION_REJECTED') return 4;
   if (['MODEL_INVALID','MODEL_TIMEOUT','BUDGET_EXHAUSTED'].includes(error.code)) return 5;
   return 1;
@@ -275,6 +277,7 @@ async function main(): Promise<void> {
     else if (outcome.ok === false) process.exitCode = 1;
     else if (outcome.run?.status === 'cancelled') process.exitCode = 130;
     else if (outcome.run?.status === 'budget_exhausted') process.exitCode = 5;
+    else if (outcome.run?.status === 'waiting_protocol') process.exitCode = 3;
     else if (outcome.run?.status === 'error') process.exitCode = 1;
     else if (['completed_failed','completed_inconclusive'].includes(outcome.run?.status ?? '') || ['failed','inconclusive'].includes(outcome.report?.status ?? '')) process.exitCode = 4;
     if (controller.signal.aborted) process.exitCode = 130;

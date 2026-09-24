@@ -29,7 +29,7 @@ test('CLI init is offline, refuses overwrite, and doctor does not create a datab
     const config = await loadConfiguration(path); assert.equal(config.strategy, join(directory, 'strategy.json'));
     const strategy=JSON.parse(await readFile(config.strategy,'utf8'));assert.equal(strategy.schemaVersion,'2.0');
     assert.equal(Object.hasOwn(strategy,'fallback'),false);assert.equal(Object.hasOwn(strategy.decision,'minRequiredConfidence'),false);
-    const protocol=JSON.parse(await readFile(config.evaluation.finalProtocol,'utf8'));assert.equal(protocol.version,'2.0');assert.equal(Object.hasOwn(protocol,'maxFallbackRate'),false);
+    const protocol=JSON.parse(await readFile(config.evaluation.finalProtocol,'utf8'));assert.equal(protocol.version,'3.0');assert.equal(Object.hasOwn(protocol,'maxFallbackRate'),false);
   });
 });
 
@@ -132,7 +132,7 @@ test('CLI activate and rollback reject foreign scopes, invalid report bindings, 
         researchSnapshotId:store.snapshot('test-scope',Date.now()), evaluationProtocolDigest:store.putArtifact('protocol',{id},'private'),status:'created',data:{} });
       for (const [from,to] of [['created','researching'],['researching','candidate_locked'],['candidate_locked','final_evaluating'],['final_evaluating','completed_passed']]) store.transitionRun(run.id,[from],to);
       const validationDigest = store.putArtifact('validation_report',{candidateDigest:strategyDigest,baseReleaseDigest:base,protocolDigest:'test-protocol',dependencies,status:'passed',reasons:[],
-        modelKind:'fixture',stage,sampleCount:10,meanDifference:1,lowerBound:0.5,groups:{},p95LatencyMs:1,createdAt:Date.now()},'private');
+        modelKind:'fixture',stage,sampleCount:10,meanDifference:1,lowerBound:0.5,groups:{},p95DecisionComputeMs:1,createdAt:Date.now()},'private');
       return store.registerRelease({strategyDigest,dependencies,scopeId:'test-scope',expectedActiveDigest:base,validationDigest,source:'research',researchRunId:run.id});
     };
     const invalid = register('invalid-stage','development'); const fixtureRelease = register('fixture-evidence','final');
@@ -145,7 +145,8 @@ test('CLI activate and rollback reject foreign scopes, invalid report bindings, 
     await writeFile(join(directory,'live-domain.mjs'), `import {KuhnPokerDomain} from ${JSON.stringify(entry)};export function createDomain({applicationId,scopeId}){return {domain:new KuhnPokerDomain({applicationId,scopeId})};}`);
     raw.domain = {kind:'module',path:'./live-domain.mjs',exportName:'createDomain',options:{}};
     raw.runtime.mode = 'live'; raw.decisionModel = {kind:'jev',model:'pinned-test-model',apiKeyEnv:'UNSET_MODEL_KEY',timeoutMs:1000}; await save(raw);
-    for (const name of ['activate','rollback']) await assert.rejects(command(name,'--release',fixtureRelease), {code:'VALIDATION_REJECTED'});
+    // A same-name fixture cannot borrow the live adapter's distinct behavior identity.
+    for (const name of ['activate','rollback']) await assert.rejects(command(name,'--release',fixtureRelease), {code:'VERSION_INCOMPATIBLE'});
     assert.equal((await command('status')).activeReleaseDigest, base);
   });
 });
@@ -156,7 +157,7 @@ test('CLI rollback consults the external domain activation checkpoint', async ()
     const entry = pathToFileURL(resolve('dist/index.js')).href;
     await writeFile(join(directory,'blocked-domain.mjs'), `import {AuctionDomain} from ${JSON.stringify(entry)};export function createDomain({applicationId,scopeId}){const domain=new AuctionDomain({applicationId,scopeId});domain.canActivate=async()=>false;return {domain};}`);
     raw.domain = {kind:'module',path:'./blocked-domain.mjs',exportName:'createDomain',options:{}}; await save(raw);
-    await assert.rejects(command('rollback','--release',initial.activeReleaseDigest), {code:'CONFLICT'});
+    await assert.rejects(command('rollback','--release',initial.activeReleaseDigest), {code:'ACTIVATION_DEFERRED'});
   }, 'auction');
 });
 

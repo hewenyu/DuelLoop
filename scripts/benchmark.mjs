@@ -13,7 +13,7 @@ async function main() {
  const model=configuredModel(options.fixture),usage=usageAccumulator();
  const directory=await mkdtemp(join(tmpdir(),'duelloop-benchmark-'));
  let calls=0;
- const measuredModel={id:model.id,kind:model.kind,score:async input=>{
+ const measuredModel={id:model.id,kind:model.kind,behaviorIdentity:model.behaviorIdentity,score:async input=>{
   if(calls>=options.maxCalls)throw Object.assign(Error('Benchmark call budget exceeded'),{code:'BUDGET_EXHAUSTED'});
   calls++;
   try {const result=await model.score(input);addUsage(usage,result.usage);return result;}
