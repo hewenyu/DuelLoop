@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateCandidate, validateProtocol } from '../dist/evaluation.js';
 import { createAuctionStrategy } from '../dist/domains.js';
+import { canonicalize } from '../dist/utils.js';
 import { decisionPolicyRuntimeVersion, modelBehaviorDigest } from '../dist/runtime.js';
 const decisionPolicy = { maxDecisionMs: 5000, executionReserveMs: 25 };
 const baseline = createAuctionStrategy(); baseline.scope.domain = 'test'; baseline.version = '1';
@@ -145,4 +146,53 @@ test('matching model names do not authorize a different adapter behavior or mode
   await assert.rejects(evaluateCandidate({candidate,baseline,protocol,adapter,model:changed,dependencies,baseReleaseDigest:'base',stage:'final'}),{code:'VERSION_INCOMPATIBLE'});
  }
  assert.equal(called,false);
+});
+
+async function evaluateUsage(usages) {
+ let index = 0, evidence;
+ const adapter = { id: 'billing-evidence', decisionPolicy, domainDependencies, async episode({ strategy }) {
+  return { ...episode(strategy.version === '2' ? 1 : 0), modelCalls: 1, usage: usages[index++ % usages.length] };
+ } };
+ await evaluateCandidate({ candidate, baseline, protocol, adapter, model, dependencies, baseReleaseDigest: 'base', stage: 'final', onEvidence(value) { evidence = value; } });
+ assert.equal(index, 12); assert.equal(evidence.costs.modelCalls, 12);
+ return evidence;
+}
+
+test('evaluation evidence distinguishes known tokens from missing dollar billing data', async () => {
+ const { costs, blocks } = await evaluateUsage([{ inputTokens: 10, outputTokens: 5 }]);
+ assert.equal(costs.inputTokens, 120); assert.equal(costs.outputTokens, 60); assert.equal(costs.usageUnknown, false);
+ assert.equal(costs.knownCostUsd, 0); assert.equal(costs.costUnknown, true); assert.equal(Object.hasOwn(costs, 'costUsd'), false);
+ assert.equal(Object.hasOwn(blocks[0].baseline.usage, 'costUsd'), false);
+});
+
+test('mixed evaluation episodes retain a priced subtotal without claiming a complete total', async () => {
+ const { costs } = await evaluateUsage([
+  { inputTokens: 10, outputTokens: 5, costUsd: 0.25 },
+  { inputTokens: 10, outputTokens: 5 },
+  { inputTokens: 10, outputTokens: 5, knownCostUsd: 0.5, costUnknown: true },
+ ]);
+ assert.equal(costs.knownCostUsd, 3); assert.equal(costs.costUnknown, true); assert.equal(Object.hasOwn(costs, 'costUsd'), false);
+ assert.equal(costs.usageUnknown, false); assert.equal(costs.inputTokens, 120);
+});
+
+test('evaluation accepts an explicit zero dollar total and independently marks incomplete token usage', async () => {
+ const complete = (await evaluateUsage([{ inputTokens: 10, outputTokens: 5, costUsd: 0 }])).costs;
+ assert.equal(complete.costUsd, 0); assert.equal(complete.knownCostUsd, 0); assert.equal(complete.costUnknown, false); assert.equal(complete.usageUnknown, false);
+ const incompleteTokens = (await evaluateUsage([{ costUsd: 0.25 }])).costs;
+ assert.equal(incompleteTokens.costUsd, 3); assert.equal(incompleteTokens.knownCostUsd, 3); assert.equal(incompleteTokens.costUnknown, false); assert.equal(incompleteTokens.usageUnknown, true);
+});
+
+test('evaluation rejects invalid cost data as known amounts and preserves any valid subtotal', async () => {
+ const evidence = await evaluateUsage([
+  { inputTokens: 10, outputTokens: 5, costUsd: -1 },
+  { inputTokens: 10, outputTokens: 5, costUsd: Infinity },
+  { inputTokens: 10, outputTokens: 5, costUsd: 'free' },
+  { inputTokens: 10, outputTokens: 5, costUsd: 0.5 },
+ ]);
+ const { costs } = evidence;
+ assert.doesNotThrow(() => canonicalize(evidence), 'Invalid provider values must not make the retained evaluation evidence unserializable');
+ assert.equal(evidence.blocks[0].baseline.usage.costUnknown, true);
+ assert.equal(Object.hasOwn(evidence.blocks[0].baseline.usage, 'costUsd'), false);
+ assert.equal(costs.knownCostUsd, 1.5); assert.equal(costs.costUnknown, true); assert.equal(Object.hasOwn(costs, 'costUsd'), false);
+ assert.equal(costs.usageUnknown, false); assert.equal(costs.inputTokens, 120);
 });

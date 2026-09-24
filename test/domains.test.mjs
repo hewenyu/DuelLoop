@@ -171,3 +171,57 @@ test('seeded softmax evaluation uses the same per-decision sampling policy as th
   assert.deepEqual(observed, evaluationFeatures, 'Action-dependent visible history must match');
  } finally { await runtime.close(); store.close(); }
 });
+
+async function simulateUsage(usages) {
+  let calls = 0;
+  const decisionModel = { ...model, async score(request) { return { ...(await model.score(request)), usage: usages[calls++] }; } };
+  const result = await new AuctionEvaluationAdapter().episode({ strategy: createAuctionStrategy(), model: decisionModel, seed: 2, opponentId: 'fixed', trajectories: usages.length, knowledge: {}, knowledgeStateMode: 'frozen', signal: new AbortController().signal });
+  assert.equal(calls, usages.length); assert.equal(result.modelCalls, usages.length);
+  return result.usage;
+}
+
+test('official Jev-shaped token usage keeps dollar costs unknown through complete simulated trajectories', async () => {
+  const usage = await simulateUsage(Array.from({ length: 10 }, () => ({ inputTokens: 10, outputTokens: 5 })));
+  assert.equal(usage.inputTokens, 100); assert.equal(usage.outputTokens, 50);
+  assert.equal(usage.unknown, false, 'Known token counts do not become unknown when billing data are missing');
+  assert.equal(usage.costUnknown, true); assert.equal(usage.knownCostUsd, 0);
+  assert.equal(Object.hasOwn(usage, 'costUsd'), false, 'Missing dollar billing data must not become a known zero cost');
+});
+
+test('simulator preserves only the known dollar subtotal when priced and unpriced calls are mixed', async () => {
+  const usage = await simulateUsage([
+    { inputTokens: 10, outputTokens: 5, costUsd: 1.25 },
+    { inputTokens: 10, outputTokens: 5 },
+    { inputTokens: 10, outputTokens: 5, costUsd: 0 },
+    { inputTokens: 10, outputTokens: 5, knownCostUsd: 0.5, costUnknown: true },
+  ]);
+  assert.equal(usage.inputTokens, 40); assert.equal(usage.outputTokens, 20); assert.equal(usage.unknown, false);
+  assert.equal(usage.knownCostUsd, 1.75); assert.equal(usage.costUnknown, true); assert.equal(Object.hasOwn(usage, 'costUsd'), false);
+});
+
+test('explicit zero-dollar prices are known, independently of missing token counts', async () => {
+  const known = await simulateUsage(Array.from({ length: 3 }, () => ({ inputTokens: 10, outputTokens: 5, costUsd: 0 })));
+  assert.equal(known.costUsd, 0); assert.equal(known.knownCostUsd, 0); assert.equal(known.costUnknown, false); assert.equal(known.unknown, false);
+  const tokensMissing = await simulateUsage([{ costUsd: 0 }, { costUsd: 0.25 }]);
+  assert.equal(tokensMissing.unknown, true); assert.equal(tokensMissing.costUnknown, false); assert.equal(tokensMissing.costUsd, 0.25);
+});
+
+test('invalid provider dollar values stay unknown instead of contaminating costs or replacing decisions', async () => {
+  for (const costUsd of [NaN, Infinity, -1, '0', null]) {
+    const usage = await simulateUsage([{ inputTokens: 10, outputTokens: 5, costUsd }]);
+    assert.equal(usage.inputTokens, 10); assert.equal(usage.outputTokens, 5); assert.equal(usage.unknown, false);
+    assert.equal(usage.knownCostUsd, 0); assert.equal(usage.costUnknown, true); assert.equal(Object.hasOwn(usage, 'costUsd'), false);
+  }
+});
+
+
+test('invalid or overflowing token counts remain incomplete without discarding independently known dollar costs', async () => {
+  for (const inputTokens of [0.5, Number.MAX_SAFE_INTEGER + 1, NaN, -1]) {
+    const usage = await simulateUsage([{ inputTokens, outputTokens: 5, costUsd: 0.25 }]);
+    assert.equal(usage.unknown, true); assert.equal(usage.inputTokens, 0); assert.equal(usage.outputTokens, 5);
+    assert.equal(usage.costUnknown, false); assert.equal(usage.costUsd, 0.25); assert.equal(usage.knownCostUsd, 0.25);
+  }
+  const overflow = await simulateUsage([{ inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 5, costUsd: 0.25 }, { inputTokens: 1, outputTokens: 5, costUsd: 0.25 }]);
+  assert.equal(overflow.unknown, true); assert.equal(overflow.inputTokens, Number.MAX_SAFE_INTEGER); assert.equal(overflow.outputTokens, 10);
+  assert.equal(overflow.costUnknown, false); assert.equal(overflow.costUsd, 0.5);
+});

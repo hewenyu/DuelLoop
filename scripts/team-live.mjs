@@ -53,10 +53,11 @@ async function main() {
     output:input.role==='integrator'?{status:'no_change',reason:'Offline interface check; no real research was performed'}:{analysis:'Fixture verifies role/session interfaces only'},usage:{inputTokens:0,outputTokens:0,costUsd:0,unknown:false},
    };
    addUsage(researchUsage,answer.usage);invocation.status='completed';invocation.finishedAt=Date.now();invocation.usage=answer.usage;
+   invocation.sessionInfo=rawProvider?.sessionInfo(input.sessionId)??null;
    invocation.outputDigest=store.putArtifact('team_role_output',{runId:runId??null,role:input.role,sessionId:input.sessionId,output:answer.output,usage:answer.usage},'private');
    return answer;
-  } catch(error){invocation.status='failed';invocation.finishedAt=Date.now();invocation.errorCode=error.code??'PROVIDER_ERROR';invocation.usage=error.context?.usage??{unknown:true};addUsage(researchUsage,invocation.usage);throw error;}
- }};
+  } catch(error){invocation.status='failed';invocation.finishedAt=Date.now();invocation.errorCode=error.code??'PROVIDER_ERROR';invocation.usage=error.context?.usage??{unknown:true};invocation.sessionInfo=rawProvider?.sessionInfo(input.sessionId)??null;addUsage(researchUsage,invocation.usage);throw error;}
+ },releaseSession:async sessionId=>{await rawProvider?.releaseSession(sessionId);}};
  const baseline=createKuhnStrategy();
  // This is the ordinary illustrative baseline, not the deliberately reversed R2 capability fixture.
  const protocol={version:'3.0',id:`normal-${researchMode}-final-v1`,domainId:domain.id,seeds:holdout.seeds,opponentIds:['calling','tight','random'],trajectoriesPerSeed:2,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'net chips per hand'},minSamples:4,minimumImprovement:.01,maxGroupRegression:.5,confidenceLevel:.95,maxP95DecisionComputeMs:configuration.decisionMs,maxDevelopmentEvalRuns:1,maxFinalEvaluationsPerRun:1,holdoutId:holdout.id,maxHoldoutUses:1};
@@ -93,7 +94,7 @@ async function main() {
   const result=await orchestrator.run(run.id);
   const expectedRoles=['researcher','adversary','integrator'];
   const sessionIdFor=role=>`${run.id}:${researchMode==='team'?role:'single'}`;
-  const sessions=expectedRoles.map(role=>({role,sessionId:sessionIdFor(role),info:rawProvider?.sessionInfo(sessionIdFor(role))??{fixture:check,invoked:roleRuns.some(r=>r.role===role)}}));
+  const sessions=expectedRoles.map(role=>({role,sessionId:sessionIdFor(role),info:roleRuns.findLast(r=>r.sessionId===sessionIdFor(role))?.sessionInfo??{fixture:check,invoked:roleRuns.some(r=>r.role===role)},released:rawProvider?rawProvider.sessionInfo(sessionIdFor(role))===null:null}));
   const allRolesCompleted=expectedRoles.every(role=>roleRuns.some(invocation=>invocation.role===role&&invocation.status==='completed'));
   const distinctSessionCount=new Set(roleRuns.map(invocation=>invocation.sessionId)).size;
   const distinctSessions=distinctSessionCount===(researchMode==='team'?3:1);

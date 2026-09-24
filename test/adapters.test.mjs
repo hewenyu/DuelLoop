@@ -28,7 +28,7 @@ test('Jev uses the real SDK request mapper, preserves fractional expected scores
   assert.ok(request.signal instanceof AbortSignal);
   assert.equal(answer.answers.call_gain.score, 1.4);
   assert.equal(answer.model, 'jev-pinned-response');
-  assert.deepEqual(answer.usage, { inputTokens: 42, outputTokens: 12, unknown: false });
+  assert.deepEqual(answer.usage, { inputTokens: 42, outputTokens: 12, unknown: false, costUnknown: true, knownCostUsd: 0 });
 });
 
 test('Jev rejects missing/malformed scores and more than ten levels', async () => {
@@ -74,7 +74,7 @@ test('Jev preserves validated response usage when Score or Choice answers are re
         : model.choice({ state: {}, instructions: 'Choose', candidates: { check: 'Pass', bet: 'Stake' }, signal: signal() });
       await assert.rejects(call, error => {
         assert.equal(error.code, 'MODEL_INVALID');
-        assert.deepEqual(error.context.usage, { inputTokens: 42, outputTokens: 12, unknown: false });
+        assert.deepEqual(error.context.usage, { inputTokens: 42, outputTokens: 12, unknown: false, costUnknown: true, knownCostUsd: 0 });
         assert.equal(error.context.usageUnknown, false);
         assert.doesNotMatch(JSON.stringify(error), /SUPER_SECRET|PRIVATE_BODY_SENTINEL/);
         return true;

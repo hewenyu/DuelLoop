@@ -62,7 +62,15 @@ export interface StrategyPackage {
 }
 export interface ScoreQuestion { id: string; actionId: string; dimensionId: string; instructions: string; criteria: string[] }
 export interface ScoreAnswer { score: number; confidence: number; probabilities: Record<string, number> }
-export interface ModelUsage { inputTokens?: number; outputTokens?: number; costUsd?: number; unknown?: boolean }
+export interface ModelUsage {
+  inputTokens?: number; outputTokens?: number;
+  /** Complete dollar total, present only when every included cost is known. */
+  costUsd?: number;
+  /** Subtotal of known dollar costs; never implies all calls have been priced. */
+  knownCostUsd?: number; costUnknown?: boolean;
+  /** Token counts are missing or incomplete; dollar cost is tracked separately. */
+  unknown?: boolean;
+}
 export interface DecisionModel {
   id: string; kind: 'real' | 'fixture';
   /** Credential-free, explicit identity of all behavior-affecting adapter/deployment settings. */
@@ -91,7 +99,7 @@ export interface DecisionRecord {
   startedAt: number; finishedAt: number; randomSeed?: string; modelLatencyMs?: number;
 }
 export type RunStatus = 'created' | 'researching' | 'development_evaluating' | 'candidate_locked'
-  | 'final_evaluating' | 'cancel_requested' | 'cancelled' | 'no_change' | 'budget_exhausted'
+  | 'final_evaluating' | 'validated_pending_release' | 'cancel_requested' | 'cancelled' | 'no_change' | 'budget_exhausted'
   | 'completed_passed' | 'completed_failed' | 'completed_inconclusive' | 'error' | 'waiting_protocol';
 export interface ResearchRun {
   id: string; scopeId: string; baseReleaseDigest: string; researchSnapshotId: string;
@@ -154,9 +162,13 @@ export interface ResearchProvider {
     maxTokens: number; sessionId: string;
     /** Current framework budget excluding this call's uncommitted cumulative usage; providers subtract their own usage. */
     getRemainingTokens?: () => number;
+    /** Synchronous durable-state guard; invoke immediately before every internal model request. */
+    beforeModelRequest?: () => void;
     /** Reports this call's cumulative usage after each response; notification does not commit budget counters. */
     onUsage?: (usage: ModelUsage) => void;
   }): Promise<{ output: Json; usage: ModelUsage }>;
+  /** Release one run's session after in-flight work settles, without disposing other sessions. */
+  releaseSession?(sessionId: string): Promise<void>;
   dispose?(): Promise<void>;
 }
 export interface JournalEvent { id: number; type: string; scopeId: string; timestamp: number; data: Json; visibility: 'public' | 'private' }
@@ -194,6 +206,8 @@ export interface DuelLoopStore {
   listRuns(scopeId?: string): ResearchRun[];
   activeRun(scopeId: string): ResearchRun | undefined;
   transitionRun(id: string, expected: RunStatus[], next: RunStatus, data?: Record<string, Json>): ResearchRun;
+  recordFinalValidation(id: string, report: ValidationReport, evidenceDigest?: string): ResearchRun;
+  finalizeResearchPublication(id: string): ResearchRun;
   consumeBudget(id: string, counter: string, limit: number, amount?: number): number;
   cancelRun(id: string): ResearchRun;
   claimHoldout(id: string, runId: string, limit: number): void;

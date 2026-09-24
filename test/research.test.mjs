@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { SqliteStore } from '../dist/storage.js';
 import { ResearchOrchestrator, validateSubmission } from '../dist/research.js';
 import { KuhnPokerDomain, createKuhnStrategy } from '../dist/domains.js';
@@ -8,6 +12,7 @@ import { digest } from '../dist/utils.js';
 import { validateToolArguments } from '@earendil-works/pi-ai';
 import { decisionPolicyRuntimeVersion, modelBehaviorDigest } from '../dist/runtime.js';
 import { DuelLoopError } from '../dist/errors.js';
+import { ResearchWorker } from '../dist/worker.js';
 const behaviorIdentity={adapterVersion:'research-test-fixture-v1',deploymentVersion:'research-test-v1',protocolVersion:'score-v1',configurationDigest:digest({fixture:true})};
 const decisionPolicy = { maxDecisionMs: 5000, executionReserveMs: 25 };
 const evaluationQuestions=[{id:'gain:check',actionId:'check',dimensionId:'gain',instructions:'Fixture utility',criteria:['low','high']}];
@@ -15,7 +20,7 @@ const evaluationAnswers={'gain:check':{score:0,confidence:0,probabilities:{'0':1
 const domainDependencies = { rules:'1', featureBuilder:'1', knowledgeUpdater:'1',  continuationPolicy:'1', contextDigest:digest(new KuhnPokerDomain().context) };
 const protocol = {version:'3.0',id:'final',domainId:'kuhn-poker',seeds:[701,702,703],opponentIds:['calling'],trajectoriesPerSeed:10,knowledgeStateMode:'frozen',initialKnowledge:{},metric:{name:'reward',direction:'maximize',unit:'chips'},minSamples:3,minimumImprovement:0,maxGroupRegression:0,confidenceLevel:.95,maxP95DecisionComputeMs:100,maxDevelopmentEvalRuns:2,maxFinalEvaluationsPerRun:1,holdoutId:'secret-holdout',maxHoldoutUses:1};
 function setup(provider,extra={}) {
- const store=new SqliteStore(), domain=new KuhnPokerDomain({scopeId:'scope'}), baseline=createKuhnStrategy();
+ const store=extra.store??new SqliteStore(), domain=new KuhnPokerDomain({scopeId:'scope'}), baseline=createKuhnStrategy();
  const model={id:'fixture',kind:'fixture',behaviorIdentity,score:async()=>{throw Error('not used by synthetic evaluator')}};
  const dependencies={model:model.id,modelKind:model.kind,modelBehaviorDigest:modelBehaviorDigest(model),runtime:decisionPolicyRuntimeVersion(decisionPolicy),rules:'1',featureBuilder:'1',knowledgeUpdater:'1',continuationPolicy:'1',contextDigest:digest(domain.context)};
  const release=store.registerRelease({strategyDigest:store.putArtifact('strategy',baseline),dependencies,scopeId:'scope',expectedActiveDigest:null,validationDigest:null,source:'bootstrap'});
@@ -24,7 +29,7 @@ function setup(provider,extra={}) {
  const evaluator={id:'synthetic-fixture-no-domain-performance-claim',decisionPolicy,domainDependencies,episode:async({strategy})=>({reward:strategy.version==='v1'?0:1,decisions:10,decisionComputeLatenciesMs:Array(10).fill(1),modelCalls:0})};
  const orchestrator=new ResearchOrchestrator({store,domain,model,evaluator,dependencies,providers:{researcher:provider},...extra});
  const run=orchestrator.create({scopeId:'scope',protocol});
- return {store,domain,baseline,orchestrator,run,release};
+ return {store,domain,baseline,orchestrator,run,release,model,evaluator,dependencies};
 }
 function submission(f) {
  const s=structuredClone(f.baseline); s.version='v2';s.parentVersion='v1';s.provenance={researchRunId:f.run.id,snapshotId:f.run.researchSnapshotId,hypothesis:'Avoid weak-card exposure'};
@@ -68,7 +73,7 @@ test('single research uses one session, validates real contract and keeps final 
  assert.equal(result.run.status,'completed_passed',JSON.stringify(result.run));assert.equal(result.report.modelKind,'fixture');assert.ok(result.releaseDigest);
  assert.equal(new Set(sessions).size,1);assert.equal(sessions.length,3);
  assert.equal(f.store.activeRelease('scope'),f.release,'research does not auto-activate');
- assert.ok(prompts.every(p=>!p.includes('701')&&!p.includes('secret-holdout')));
+ assert.ok(prompts.every(p=>!p.includes('"seeds":')&&!p.includes('secret-holdout')),'Prompt exposes goals and opaque digests, never holdout seeds or ID');
  assert.ok(toolsets.every(t=>!t.includes('run_final_eval')));
  assert.throws(()=>f.store.getArtifact(result.validationDigest),e=>e.code==='ACCESS_DENIED');
  assert.equal(f.store.listArtifacts('validation_report').length,0);
@@ -354,7 +359,7 @@ test('phase prompts expose actionable roles and remaining budgets without promis
   assert.equal(phase.remaining.developmentEvaluations,prompts.length===1?2:1);
   assert.equal(phase.canRequestAnotherRound,input.role==='integrator'&&prompt.round===0);
   assert.ok(phase.continuation.includes('no_change is a valid result'));
-  assert.ok(!input.prompt.includes('secret-holdout'));assert.ok(!input.prompt.includes('701'));
+  assert.ok(!input.prompt.includes('secret-holdout'));assert.ok(!input.prompt.includes('"seeds":'));
   if(prompts.length===1)await input.tools.find(tool=>tool.name==='run_development_eval').execute({strategy:f.baseline});
   if(input.role==='integrator')return {output:{status:prompt.round===0?'revise':'no_change'},usage};
   return {output:{analysis:'Phase-specific fixture findings'},usage};
@@ -394,4 +399,125 @@ test('research history tool requests only a bounded scope-local projection',asyn
   assert.ok(history.length<=100);checked=true;f.store.events=original;return {output:{status:'no_change'},usage};
  }};
  f=setup(provider);assert.equal((await f.orchestrator.run(f.run.id)).run.status,'no_change');assert.equal(checked,true);f.store.close();
+});
+
+test('revise withdraws a submitted candidate until a later round explicitly resubmits it',async t=>{
+ for(const next of ['analysis','resubmit','no_change'])await t.test(next,async()=>{
+  let f,candidate,rounds=0;const provider={id:'revise-fixture',kind:'fixture',run:async input=>{
+   if(input.role!=='integrator')return {output:{analysis:'research evidence'},usage};
+   rounds++;
+   if(rounds===1||next==='resubmit')await input.tools.find(t=>t.name==='submit_candidate').execute(candidate??=submission(f));
+   return {output:rounds===1?{status:'revise'}:next==='no_change'?{status:'no_change'}:{analysis:'remaining concern'},usage};
+  }};
+  f=setup(provider,{budget:{maxRepairAttempts:0}});
+  const result=await f.orchestrator.run(f.run.id);
+  assert.equal(result.run.status,next==='resubmit'?'completed_passed':next==='no_change'?'no_change':'error');
+  assert.equal(f.store.holdoutAvailability(protocol.holdoutId,1).used,next==='resubmit'?1:0);
+  assert.equal(f.store.events({types:['research.candidate_submitted']}).length,next==='resubmit'?2:1);
+  assert.equal(f.store.events({types:['research.candidate_revision_requested']}).length,1);
+  f.store.close();
+ });
+});
+
+test('publication transaction failures preserve a recoverable final report without repeating evaluation',async t=>{
+ for(const fault of ['strategy','completed_transition','register_before','register_after','publication_event'])await t.test(fault,async()=>{
+  let f,calls=0;const provider={id:'publication-fixture',kind:'fixture',run:async input=>{calls++;if(input.role==='integrator')await input.tools.find(t=>t.name==='submit_candidate').execute(submission(f));return {output:{analysis:'candidate ready'},usage};}};
+  f=setup(provider);
+  const fail=()=>{throw new DuelLoopError('STORAGE_FAILURE',`Injected ${fault}`);};
+  const original={putArtifact:f.store.putArtifact.bind(f.store),transitionRun:f.store.transitionRun.bind(f.store),registerRelease:f.store.registerRelease.bind(f.store),appendEvent:f.store.appendEvent.bind(f.store)};
+  if(fault==='strategy')f.store.putArtifact=(kind,...args)=>{if(kind==='strategy')fail();return original.putArtifact(kind,...args);};
+  if(fault==='completed_transition')f.store.transitionRun=(id,expected,next,...args)=>{const run=original.transitionRun(id,expected,next,...args);if(next==='completed_passed')fail();return run;};
+  if(fault.startsWith('register_'))f.store.registerRelease=binding=>{if(fault==='register_before')fail();original.registerRelease(binding);return fail();};
+  if(fault==='publication_event')f.store.appendEvent=(type,...args)=>{const event=original.appendEvent(type,...args);if(type==='research.release_registered')fail();return event;};
+  await assert.rejects(f.orchestrator.run(f.run.id),{code:'STORAGE_FAILURE'});
+  assert.equal(f.store.getRun(f.run.id).status,'validated_pending_release');
+  assert.equal(f.store.pendingReleases('scope').length,0,'Partial release insertion rolls back');
+  assert.equal(f.store.events({types:['research.release_registered']}).length,0);
+  assert.equal(f.store.holdoutAvailability(protocol.holdoutId,1).used,1);
+  Object.assign(f.store,original);
+  const recovered=f.orchestrator.recover(f.run.id),counters=structuredClone(recovered.counters);
+  assert.equal(recovered.status,'completed_passed');assert.equal(typeof recovered.data.releaseDigest,'string');
+  assert.equal(f.store.pendingReleases('scope').length,1);assert.equal(calls,3);
+  assert.deepEqual(f.orchestrator.recover(f.run.id).counters,counters);
+  assert.equal(f.store.events({types:['research.release_registered']}).length,1,'Repeated recovery is idempotent');
+  assert.equal(f.store.holdoutAvailability(protocol.holdoutId,1).used,1);f.store.close();
+ });
+});
+
+test('durable pending publication and legacy successful runs recover through a newly opened store',async t=>{
+ for(const legacy of [false,true])await t.test(legacy?'legacy completed_passed':'validated pending',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'duelloop-publication-'));const path=join(directory,'state.sqlite');let f,restored;
+  const provider={id:'publication-fixture',kind:'fixture',run:async input=>{if(input.role==='integrator')await input.tools.find(t=>t.name==='submit_candidate').execute(submission(f));return {output:{analysis:'candidate ready'},usage};}};
+  try {
+   f=setup(provider,{store:new SqliteStore(path)});
+   f.store.finalizeResearchPublication=()=>{throw new DuelLoopError('STORAGE_FAILURE','Simulated process exit before local publication');};
+   await assert.rejects(f.orchestrator.run(f.run.id),{code:'STORAGE_FAILURE'});
+   if(legacy)f.store.transitionRun(f.run.id,['validated_pending_release'],'completed_passed');
+   f.store.close();restored=new SqliteStore(path);
+   const fresh=new ResearchOrchestrator({store:restored,domain:f.domain,model:f.model,evaluator:f.evaluator,dependencies:f.dependencies,providers:{researcher:{id:'forbidden-provider',kind:'fixture',run:async()=>{throw Error('Recovery must not call models');}}}});
+   const recovered=fresh.recover(f.run.id);
+   assert.equal(recovered.status,'completed_passed');assert.ok(recovered.data.releaseDigest);
+   assert.equal(restored.pendingReleases('scope').length,1);assert.equal(restored.holdoutAvailability(protocol.holdoutId,1).used,1);
+  } finally {restored?.close();rmSync(directory,{recursive:true,force:true});}
+ });
+});
+
+test('report persistence failure rolls back validation state and ends explicitly instead of claiming success',async()=>{
+ let f;const provider={id:'fixture',kind:'fixture',run:async input=>{if(input.role==='integrator')await input.tools.find(t=>t.name==='submit_candidate').execute(submission(f));return {output:{analysis:'ready'},usage};}};
+ f=setup(provider);const original=f.store.appendEvent.bind(f.store);
+ f.store.appendEvent=(type,...args)=>{if(type==='research.final_conclusion')throw new DuelLoopError('STORAGE_FAILURE','Report commit failed');return original(type,...args);};
+ const result=await f.orchestrator.run(f.run.id);
+ assert.equal(result.run.status,'error');assert.equal(result.releaseDigest,undefined);
+ assert.equal(f.store.listArtifacts('validation_report',true).length,0);assert.equal(f.store.pendingReleases('scope').length,0);
+ assert.equal(f.orchestrator.recover(f.run.id).status,'error');assert.equal(f.store.holdoutAvailability(protocol.holdoutId,1).used,1);f.store.close();
+});
+
+test('worker recovers pending local publication before exhausted protocol preflight',async()=>{
+ let f;const provider={id:'fixture',kind:'fixture',run:async input=>{if(input.role==='integrator')await input.tools.find(t=>t.name==='submit_candidate').execute(submission(f));return {output:{analysis:'ready'},usage};}};
+ f=setup(provider);const finalize=f.store.finalizeResearchPublication.bind(f.store);
+ f.store.finalizeResearchPublication=()=>{throw new DuelLoopError('STORAGE_FAILURE','Temporary local failure');};
+ await assert.rejects(f.orchestrator.run(f.run.id),{code:'STORAGE_FAILURE'});
+ let notified;const worker=new ResearchWorker({store:f.store,orchestrator:f.orchestrator,scopeId:'scope',protocol,developmentProtocol:{...protocol,id:'development',holdoutId:'development',seeds:[1,2,3]},settledTrajectories:1,cooldownMs:0,onRelease:async digest=>{notified=digest;}});
+ await assert.rejects(worker.tick(),{code:'STORAGE_FAILURE'});assert.equal(worker.status().state,'error');
+ f.store.finalizeResearchPublication=finalize;const result=await worker.tick();
+ assert.equal(result.run.status,'completed_passed');assert.equal(result.releaseDigest,notified);
+ assert.equal(await worker.tick(),null);assert.equal(worker.status().state,'waiting_protocol');f.store.close();
+});
+
+test('terminal runs release only their own completed sessions, including late cancellation settlement',async()=>{
+ let entered,resolve,session;const ready=new Promise(r=>entered=r),released=[];
+ const provider={id:'session-fixture',kind:'fixture',run:input=>{session=input.sessionId;entered();return new Promise(r=>resolve=r);},releaseSession:async id=>{released.push(id);}};
+ const f=setup(provider),running=f.orchestrator.run(f.run.id);await ready;f.orchestrator.cancel(f.run.id);
+ assert.equal((await running).run.status,'cancelled');assert.deepEqual(released,[],'An unresolved provider retains its session');
+ resolve({output:{status:'no_change'},usage});await new Promise(r=>setImmediate(r));
+ assert.deepEqual(released,[session]);assert.equal(f.store.events({types:['research.late_model_result'],allowPrivate:true}).length,1);f.store.close();
+ const completed=[];const p={id:'finished-fixture',kind:'fixture',run:async()=>({output:{status:'no_change'},usage}),releaseSession:async id=>completed.push(id)};
+ const g=setup(p);await g.orchestrator.run(g.run.id);assert.deepEqual(completed,[`${g.run.id}:single`]);g.store.close();
+});
+
+test('process exits across publication commit boundaries recover without a second holdout claim',async t=>{
+ for(const point of ['before','transition','registration','committed'])await t.test(point,async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'duelloop-publication-exit-')),path=join(directory,'state.sqlite');let f,reopened;
+  const provider={id:'crash-fixture',kind:'fixture',run:async input=>{if(input.role==='integrator')await input.tools.find(t=>t.name==='submit_candidate').execute(submission(f));return {output:{analysis:'ready'},usage};}};
+  try {
+   f=setup(provider,{store:new SqliteStore(path)});f.store.finalizeResearchPublication=()=>{throw new DuelLoopError('STORAGE_FAILURE','Deferred for crash injection');};
+   await assert.rejects(f.orchestrator.run(f.run.id),{code:'STORAGE_FAILURE'});f.store.close();
+   const script=`
+    import {SqliteStore} from ${JSON.stringify(new URL('../dist/storage.js',import.meta.url).href)};
+    const [path,id,point]=process.argv.slice(1),store=new SqliteStore(path);
+    if(point==='before')process.exit(71);
+    if(point==='transition'){const original=store.transitionRun.bind(store);store.transitionRun=(...args)=>{const result=original(...args);if(args[2]==='completed_passed')process.exit(71);return result;};}
+    if(point==='registration'){const original=store.registerRelease.bind(store);store.registerRelease=(...args)=>{original(...args);process.exit(71);};}
+    store.finalizeResearchPublication(id);process.exit(71);
+   `;
+   const exited=spawnSync(process.execPath,['--input-type=module','-e',script,path,f.run.id,point],{encoding:'utf8',timeout:10000});
+   assert.equal(exited.status,71,exited.stderr);reopened=new SqliteStore(path);
+   assert.equal(reopened.getRun(f.run.id).status,point==='committed'?'completed_passed':'validated_pending_release');
+   assert.equal(reopened.pendingReleases('scope').length,point==='committed'?1:0);
+   const orchestrator=new ResearchOrchestrator({store:reopened,domain:f.domain,model:f.model,evaluator:f.evaluator,dependencies:f.dependencies,providers:{researcher:{id:'must-not-call',kind:'fixture',run:async()=>{throw Error('No remote recovery');}}}});
+   const recovered=orchestrator.recover(f.run.id);assert.equal(recovered.status,'completed_passed');assert.ok(recovered.data.releaseDigest);
+   assert.equal(reopened.pendingReleases('scope').length,1);assert.equal(reopened.holdoutAvailability(protocol.holdoutId,1).used,1);
+   assert.equal(reopened.events({types:['research.release_registered']}).length,1);
+  } finally {reopened?.close();rmSync(directory,{recursive:true,force:true});}
+ });
 });

@@ -1,5 +1,6 @@
 import { invariant } from './errors.js';
 import { digest } from './utils.js';
+import { accumulateModelUsage, emptyModelUsage, normalizeModelUsage } from './usage.js';
 import { validateScoreAnswer, validateStrategy } from './strategy.js';
 import { decisionPolicyRuntimeVersion, modelBehaviorDigest } from './runtime.js';
 import type { BehaviorDependencies, DecisionModel, EvaluationAdapter, EvaluationEpisode, EvaluationProtocol, Features, StrategyPackage, ValidationReport } from './types.js';
@@ -82,7 +83,7 @@ function interval(values: number[], confidence: number): { meanDifference: numbe
 export interface EvaluationEvidence {
   adapterId: string; protocolDigest: string; modelKind: 'real' | 'fixture';
   blocks: {seed: number; opponentId: string; baseline: EvaluationEpisode; candidate: EvaluationEpisode; difference: number}[];
-  costs: { modelCalls: number; inputTokens: number; outputTokens: number; costUsd: number; usageUnknown: boolean };
+  costs: { modelCalls: number; inputTokens: number; outputTokens: number; costUsd?: number; knownCostUsd: number; costUnknown: boolean; usageUnknown: boolean };
 }
 export interface EvaluateCandidateOptions {
   candidate: StrategyPackage; baseline: StrategyPackage; protocol: EvaluationProtocol;
@@ -104,7 +105,8 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
   const { model: _modelBinding, modelKind: _modelKind, modelBehaviorDigest: _modelBehavior, runtime: _runtimeBinding, ...domainBinding } = dependencies;
   invariant(digest(adapter.domainDependencies) === digest(domainBinding), 'VERSION_INCOMPATIBLE', 'Evaluation domain rules, features, knowledge updater, continuation or context differ from release binding');
   const signal = options.signal ?? new AbortController().signal;
-  const evidence: EvaluationEvidence = { adapterId: adapter.id, protocolDigest: digest(protocol), modelKind: model.kind, blocks: [], costs: { modelCalls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, usageUnknown: false } };
+  const evidence: EvaluationEvidence = { adapterId: adapter.id, protocolDigest: digest(protocol), modelKind: model.kind, blocks: [], costs: { modelCalls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, knownCostUsd: 0, costUnknown: false, usageUnknown: false } };
+  const totalUsage = emptyModelUsage();
   const groups: Record<string, { meanDifference: number; lowerBound: number }> = {};
   const byOpponent = new Map<string, number[]>();
   const paired: number[] = []; const latencies: number[] = [];
@@ -149,7 +151,7 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
         validateEpisode(result);
         // Fixtures may supply precomputed statistical summaries. Real experiments must account for every decision.
         invariant(model.kind === 'fixture' || (completed >= result.decisions && result.modelCalls === calls), 'VALIDATION_REJECTED', 'Every real experimental decision requires a completed model call and accurate call accounting');
-        return result;
+        return { ...result, ...(result.usage !== undefined || result.modelCalls > 0 ? { usage: normalizeModelUsage(result.usage) } : {}) };
       };
       // Alternating order catches accidental ordering assumptions without sharing mutable state.
       let a: EvaluationEpisode, b: EvaluationEpisode;
@@ -159,10 +161,14 @@ export async function evaluateCandidate(options: EvaluateCandidateOptions): Prom
       evidence.blocks.push({seed,opponentId,baseline:structuredClone(a),candidate:structuredClone(b),difference});
       for (const item of [a,b]) {
         evidence.costs.modelCalls += item.modelCalls;
-        evidence.costs.inputTokens += item.usage?.inputTokens ?? 0;
-        evidence.costs.outputTokens += item.usage?.outputTokens ?? 0;
-        evidence.costs.costUsd += item.usage?.costUsd ?? 0;
-        if (item.modelCalls > 0 && (!item.usage || item.usage.unknown || item.usage.inputTokens === undefined || item.usage.outputTokens === undefined || item.usage.costUsd === undefined)) evidence.costs.usageUnknown=true;
+        accumulateModelUsage(totalUsage, item.usage, item.modelCalls > 0);
+        evidence.costs.inputTokens = totalUsage.inputTokens ?? 0;
+        evidence.costs.outputTokens = totalUsage.outputTokens ?? 0;
+        evidence.costs.knownCostUsd = totalUsage.knownCostUsd ?? 0;
+        evidence.costs.costUnknown = totalUsage.costUnknown ?? false;
+        evidence.costs.usageUnknown = totalUsage.unknown ?? false;
+        if (totalUsage.costUsd === undefined) delete evidence.costs.costUsd;
+        else evidence.costs.costUsd = totalUsage.costUsd;
       }
       block.push(difference);
       const group = byOpponent.get(opponentId) ?? []; group.push(difference); byOpponent.set(opponentId,group);

@@ -9,6 +9,7 @@ import {
 import { InMemoryCredentialStore, InMemoryModelsStore, type TSchema } from '@earendil-works/pi-ai';
 import { DuelLoopError, invariant } from './errors.js';
 import { digest, jsonValue } from './utils.js';
+import { accumulateModelUsage, emptyModelUsage } from './usage.js';
 import type { DecisionModel, Features, Json, ModelUsage, ResearchProvider, ResearchTool, ScoreAnswer, ScoreQuestion } from './types.js';
 
 function cancelled(signal: AbortSignal): void {
@@ -33,7 +34,7 @@ function confidence(value: unknown): asserts value is number {
 }
 function usageFromJev(value: { input_tokens: number; output_tokens: number } | undefined): ModelUsage {
   invariant(value && Number.isSafeInteger(value.input_tokens) && value.input_tokens >= 0 && Number.isSafeInteger(value.output_tokens) && value.output_tokens >= 0, 'MODEL_INVALID', 'Invalid model usage');
-  return { inputTokens: value.input_tokens, outputTokens: value.output_tokens, unknown: false };
+  return { inputTokens: value.input_tokens, outputTokens: value.output_tokens, unknown: false, costUnknown:true, knownCostUsd:0 };
 }
 function jevError(error: unknown, signal: AbortSignal, usage?: ModelUsage): never {
   const accounting = { usage: usage ?? { unknown: true }, usageUnknown: usage === undefined };
@@ -193,6 +194,8 @@ export class PiResearchProvider implements ResearchProvider {
   readonly #options: PiResearchOptions;
   readonly #sessions = new Map<string, PiSession>();
   readonly #pending = new Set<string>();
+  readonly #settlements = new Map<string,{done:Promise<void>;resolve:()=>void}>();
+  readonly #releases = new Map<string,Promise<void>>();
   #runtime?: Promise<ModelRuntime>;
   #disposed = false;
   constructor(options: PiResearchOptions) {
@@ -259,7 +262,7 @@ export class PiResearchProvider implements ResearchProvider {
     invariant(!this.#disposed, 'CONFLICT', 'Research provider is disposed');
     invariant(typeof input.sessionId === 'string' && input.sessionId.length && Number.isSafeInteger(input.maxTokens) && input.maxTokens > 0, 'CONFIG_INVALID', 'Research session and positive token budget are required');
     invariant(typeof input.role === 'string' && input.role.length && typeof input.prompt === 'string' && input.prompt.length, 'CONFIG_INVALID', 'Research role and prompt must be nonempty');
-    invariant(!this.#pending.has(input.sessionId) && !this.#sessions.get(input.sessionId)?.busy, 'CONFLICT', 'Research session is already running');
+    invariant(!this.#pending.has(input.sessionId) && !this.#releases.has(input.sessionId) && !this.#sessions.get(input.sessionId)?.busy, 'CONFLICT', 'Research session is already running');
     const names = input.tools.map(tool => tool.name);
     invariant(new Set(names).size === names.length && names.every(name => /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) && !['read','bash','edit','write','grep','find','ls','powershell'].includes(name)), 'CONFIG_INVALID', 'Research tools require unique, non-builtin names');
     for (const tool of input.tools) {
@@ -267,11 +270,15 @@ export class PiResearchProvider implements ResearchProvider {
       jsonValue(tool.schema);
     }
     this.#pending.add(input.sessionId);
+    let resolveSettled!:()=>void;const done=new Promise<void>(resolve=>{resolveSettled=resolve;});
+    this.#settlements.set(input.sessionId,{done,resolve:resolveSettled});
     let state: PiSession | undefined;
     let unsubscribe: (() => void) | undefined;
     let abort: (() => void) | undefined;
     let restoreStream: (() => void) | undefined;
-    const usage = { inputTokens: 0, outputTokens: 0, costUsd: 0, unknown: false };
+    const usage=emptyModelUsage();
+    const incompleteUsage=()=>{const incomplete={...usage};accumulateModelUsage(incomplete,undefined);return incomplete;};
+    let requestFailure:{error:DuelLoopError;usage:ModelUsage}|undefined;
     try {
       state = await this.#getSession(input.sessionId, input.tools, input.signal);
       state.busy = true;
@@ -281,7 +288,7 @@ export class PiResearchProvider implements ResearchProvider {
       const remainingTokens = () => {
         const available = input.getRemainingTokens?.() ?? input.maxTokens;
         invariant(Number.isSafeInteger(available) && available >= 0, 'CONFIG_INVALID', 'Framework remaining token budget must be a nonnegative integer', { usage: { ...usage } });
-        return Math.min(input.maxTokens, available) - usage.inputTokens - usage.outputTokens;
+        return Math.min(input.maxTokens, available) - (usage.inputTokens??0) - (usage.outputTokens??0);
       };
       state.guard = () => {
         cancelled(input.signal);
@@ -291,29 +298,39 @@ export class PiResearchProvider implements ResearchProvider {
           throw new DuelLoopError('BUDGET_EXHAUSTED', 'Research token budget exhausted', { usage: { ...usage } });
         }
       };
+      const assertModelRequest=()=>{
+        const measured={...usage};
+        try {input.beforeModelRequest?.();cancelled(input.signal);}
+        catch(error) {
+          requestFailure??={error:error instanceof DuelLoopError?error:new DuelLoopError('MODEL_INVALID','Research send guard failed'),usage:measured};
+          throw requestFailure.error;
+        }
+      };
       const stream = session.agent.streamFunction;
       session.agent.streamFunction = (model, context, options) => {
-        cancelled(input.signal);
+        assertModelRequest();
         const remaining = remainingTokens();
         if (usage.unknown || remaining <= 0 || ++turns > (this.#options.maxTurns ?? 16)) {
           budgetExceeded = true;
           throw new DuelLoopError('BUDGET_EXHAUSTED', 'Research request budget exhausted', { usage: { ...usage } });
         }
-        return stream(model, context, { ...options, maxTokens: Math.min(remaining, model.maxTokens),
+        return stream(model, context, { ...options, maxTokens: Math.min(remaining, model.maxTokens),maxRetries:0,
+          onPayload:async(payload,requestModel)=>{assertModelRequest();const next=await options?.onPayload?.(payload,requestModel);assertModelRequest();return next;},
           signal: options?.signal ? AbortSignal.any([options.signal, input.signal]) : input.signal });
       };
       restoreStream = () => { session.agent.streamFunction = stream; };
       unsubscribe = session.subscribe(event => {
         if (event.type === 'message_end' && event.message.role === 'assistant') {
           const measured = event.message.usage;
-          usage.inputTokens += measured.input + measured.cacheRead + measured.cacheWrite;
-          usage.outputTokens += measured.output;
-          usage.costUsd += measured.cost.total;
-          if (measured.totalTokens === 0 || event.message.stopReason === 'aborted' || event.message.stopReason === 'error') usage.unknown = true;
+          // A rejected pre-send guard produces a synthetic pi error message without an HTTP request.
+          if(requestFailure&&measured.totalTokens===0)return;
+          accumulateModelUsage(usage,{inputTokens:measured.input+measured.cacheRead+measured.cacheWrite,outputTokens:measured.output,
+            costUsd:measured.cost?.total,unknown:measured.totalTokens===0||event.message.stopReason==='aborted'||event.message.stopReason==='error',
+            costUnknown:measured.totalTokens===0||event.message.stopReason==='aborted'||event.message.stopReason==='error'});
           input.onUsage?.({ ...usage });
         }
       });
-      abort = () => { usage.unknown = true; void session.abort(); };
+      abort = () => { accumulateModelUsage(usage,undefined);void session.abort(); };
       input.signal.addEventListener('abort', abort, { once: true });
       cancelled(input.signal);
       let prompt = `Start a new research phase. Any temporary format-repair restrictions from previous replies have ended. Follow this phase's instructions; you may perform fresh analysis, gather permitted evidence, and use only the tools currently supplied for this invocation. Historical repair requests do not restrict this phase.\nResearch role: ${input.role}\nCurrently permitted tools: ${JSON.stringify(names)}\n${input.prompt}\nFinal response format: exactly one valid JSON value, without Markdown or surrounding prose.`;
@@ -340,14 +357,27 @@ export class PiResearchProvider implements ResearchProvider {
       }
       throw new DuelLoopError('MODEL_INVALID', 'pi final response format repair failed', { usage });
     } catch (error) {
-      if (input.signal.aborted) throw new DuelLoopError('CANCELLED', 'Research cancelled', { usage: { ...usage, unknown: true } });
+      if(requestFailure)throw new DuelLoopError(requestFailure.error.code,requestFailure.error.message,{...requestFailure.error.context,usage:requestFailure.usage});
+      if (input.signal.aborted) throw new DuelLoopError('CANCELLED', 'Research cancelled', { usage: incompleteUsage() });
       if (error instanceof DuelLoopError) throw error;
-      throw new DuelLoopError('MODEL_INVALID', 'pi research request failed', { usage: { ...usage, unknown: true } });
+      throw new DuelLoopError('MODEL_INVALID', 'pi research request failed', { usage: incompleteUsage() });
     } finally {
       if (abort) input.signal.removeEventListener('abort', abort);
       unsubscribe?.(); restoreStream?.(); if (state) { state.session.setActiveToolsByName(names); state.busy = false; state.guard = undefined; }
       this.#pending.delete(input.sessionId);
+      this.#settlements.delete(input.sessionId);resolveSettled();
     }
+  }
+  /** Release only this completed research session; unrelated concurrent runs stay alive. */
+  releaseSession(sessionId:string):Promise<void> {
+    const existing=this.#releases.get(sessionId);if(existing)return existing;
+    const releasing=(async()=>{
+      await this.#settlements.get(sessionId)?.done;
+      const state=this.#sessions.get(sessionId);if(!state)return;
+      this.#sessions.delete(sessionId);state.currentTools.clear();state.guard=undefined;state.session.dispose();
+    })();
+    this.#releases.set(sessionId,releasing);
+    void releasing.then(()=>this.#releases.delete(sessionId),()=>this.#releases.delete(sessionId));return releasing;
   }
   /** Non-sensitive capability diagnostics. Does not expose prompts, credentials, or private evidence. */
   sessionInfo(sessionId: string) {
@@ -357,7 +387,7 @@ export class PiResearchProvider implements ResearchProvider {
   }
   async dispose(): Promise<void> {
     this.#disposed = true;
-    await Promise.all([...this.#sessions.values()].map(async ({ session }) => { await session.abort(); session.dispose(); }));
-    this.#sessions.clear();
+    await Promise.all([...this.#sessions.values()].map(({session})=>session.abort()));
+    await Promise.all([...new Set([...this.#sessions.keys(),...this.#pending])].map(id=>this.releaseSession(id)));
   }
 }

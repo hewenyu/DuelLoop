@@ -1,6 +1,6 @@
 # DuelLoop：面向对抗博弈的双循环决策框架
 
-当前工程契约以 [0.2.0 持续运行修复](engineering-reliability.md)和[验证记录](validation.md)为准；下文保留设计与历史实施上下文。
+当前工程契约以 [0.2.0 持续运行修复](engineering-reliability.md)、[0.2.1 SDK 接入](sdk.md)和[验证记录](validation.md)为准；下文保留设计与历史实施上下文。
 
 版本：v0.3 架构＋2026-09-23 模型决策语义修订
 

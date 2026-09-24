@@ -1,9 +1,9 @@
 # SDK 接入
 
-DuelLoop 目前为 `0.2.0` 本地分发包，采用 [MIT 许可证](../LICENSE)，Node.js 要求为 24 或更新版本，模块格式为 ESM。`package.json` 保留 `private: true`，尚未发布到公共 npm。仓库构建后运行 `npm pack`，在自己的项目中安装得到的 `.tgz`。
+DuelLoop 目前为 `0.2.1` 本地分发包，采用 [MIT 许可证](../LICENSE)，Node.js 要求为 24 或更新版本，模块格式为 ESM。`package.json` 保留 `private: true`，尚未发布到公共 npm。仓库构建后运行 `npm pack`，在自己的项目中安装得到的 `.tgz`。
 
 ```sh
-npm install /absolute/path/duelloop-0.2.0.tgz
+npm install /absolute/path/duelloop-0.2.1.tgz
 ```
 
 应用使用 `import ... from 'duelloop'`。包只导出根入口，不支持 `duelloop/dist/...` 或仓库 `src/...` 路径。`demo/` 是可复制的消费项目；`npm run check:package` 会将当次 tarball 装入独立临时项目，运行 SDK、领域合规、公开类型和 CLI 检查。
@@ -110,17 +110,23 @@ if (result.releaseDigest) await app.activatePending('policy');
 
 上例的 `PiResearchProvider`、`ResearchOrchestrator` 需从 `duelloop` 导入；协议及评价器由应用提供，真实研究会产生模型费用。单模型模式复用一个会话跨研究、对抗和整合阶段；团队模式为三个角色分别提供 provider，框架使用独立角色会话。同一模型也可供不同角色使用。
 
+研究 provider 的 `run(input)` 接收 `beforeModelRequest`，自定义实现应在每次实际模型请求前调用，包括内部续问、修复和重试。包装已有 provider 时透传该参数及 `releaseSession(sessionId)`；内置 Pi 在每轮研究结束、在途调用结算后释放会话。全应用关闭时仍调用 `await provider.dispose()`，再关闭共享 store。
+
+整合者返回 `status: "revise"` 会撤销本轮已提交候选的最终评估资格；下一轮必须再次通过 `submit_candidate` 提交，明确接受未修改内容也要重新提交。只有分析文字不能使上一轮候选自动进入保留集评估。
+
 研究工具 `query_experience` 默认返回 5 条摘要，可按种类和偏移分页（每页最多 20 条），也可用 `evidenceRef` 读取完整冻结记录或指定字段。分页不会改变研究快照，引用其他快照中的记录会被拒绝。这样模型可以逐步查阅观察、合法动作、回答和反馈修订，避免每次加载全部历史。
 
 自定义评价器同时声明 `decisionPolicy` 和 `domainDependencies`。后者是实际实验领域的规则、特征构建、知识更新、参考续打版本及上下文摘要；它们必须与 `app.dependencies` 对应部分完全一致。应用修改特征构建或上下文后，默认内置评价器不能继续为它生成验证结论。
 
-`run()` 可返回 `waiting_protocol`（没有最终评价资源）、`no_change`、`completed_failed`、`completed_inconclusive`、预算耗尽或取消。只有通过最终验证才登记研究发布，登记不等于激活。最终失败结束该轮，不会无限反复优化同一保留集。`app.activate()` 还会核对基线摘要、依赖、激活模式和领域边界。
+`run()` 可返回 `waiting_protocol`（没有最终评价资源）、`no_change`、`completed_failed`、`completed_inconclusive`、预算耗尽或取消。只有通过最终验证才登记研究发布，登记不等于激活。最终报告已保存、发布登记失败时 `run()` 抛出故障，持久任务保持 `validated_pending_release`；`recover(runId)` 从原报告完成本地发布并返回含 `data.releaseDigest` 的任务，不重新花费模型或最终评估预算。Worker 也会先恢复这一状态。最终失败结束该轮，不会无限反复优化同一保留集。`app.activate()` 还会核对基线摘要、依赖、激活模式和领域边界。
+
+`ModelUsage.unknown` 表示 Token 完整性；`costUnknown` 独立表示美元费用是否缺失，`knownCostUsd` 保留已知小计，`costUsd` 仅在总额完整时存在。评估证据的 `costs.usageUnknown` 同样只表示 Token 完整性。没有价格不能显示为总成本 `$0`；未知费用不影响已知 Token 的预算核算。
 
 ## 兼容范围
 
 | 契约 | 当前支持 | 不兼容时的处理 |
 | --- | --- | --- |
-| npm SDK | `0.2.0` 开发版，ESM，Node.js 24 | 当前 API 仍可能调整；V1.0 后遵循 SemVer |
+| npm SDK | `0.2.1` 开发版，ESM，Node.js 24 | 当前 API 仍可能调整；V1.0 后遵循 SemVer |
 | 应用配置 | `schemaVersion: "1.0"` | 拒绝未知版本、字段和非法组合 |
 | 策略 | `schemaVersion: "2.0"`，Score | 拒绝新语义、未知领域特征和不匹配的契约版本 |
 | 评价协议 | `version: "3.0"` | 创建研究前校验并固定摘要，不能事后换门槛 |

@@ -20,17 +20,29 @@ function setup(options={}) {
 }
 test('rejected model answers retain known usage and stop without issuing execution',async()=>{
  const measured={inputTokens:71,outputTokens:13,unknown:false};
+ const recorded={...measured,knownCostUsd:0,costUnknown:true};
  const model={id:'rejected-answer',kind:'fixture',behaviorIdentity:fixture().behaviorIdentity,score:async()=>{throw new DuelLoopError('MODEL_INVALID','Bad answer',{usage:measured});}};
  const x=setup({model});
  try {
   let calls=0;x.domain.execute=async()=>{calls++;throw new Error('must never execute');};
   await assert.rejects(()=>x.runtime.step('usage-stopped'),error=>error.code==='MODEL_INVALID'&&typeof error.context.decisionId==='string');
   const decision=x.store.events().find(event=>event.type==='decision').data;
-  assert.equal(decision.decisionSource,'stopped');assert.equal(decision.action,null);assert.deepEqual(decision.usage,measured);
-  assert.deepEqual(x.store.getArtifact(digest(decision)).usage,measured);
+  assert.equal(decision.decisionSource,'stopped');assert.equal(decision.action,null);assert.deepEqual(decision.usage,recorded);
+  assert.deepEqual(x.store.getArtifact(digest(decision)).usage,recorded);
   assert.equal(calls,0);assert.equal(x.store.intents().length,0);assert.equal(x.runtime.status().stopping,true);
   assert.equal(x.runtime.status().failure.decisionId,decision.decisionId);
   await assert.rejects(()=>x.runtime.start({streamIds:['usage-stopped'],maxSteps:1}),{code:'DECISION_STOPPED'});
+ } finally {await x.runtime.close();x.store.close();}
+});
+test('runtime persists partial dollar cost without declaring a complete total',async()=>{
+ const inner=fixture();const model={id:inner.id,kind:inner.kind,behaviorIdentity:inner.behaviorIdentity,
+  score:async input=>({...await inner.score(input),usage:{inputTokens:7,outputTokens:3,knownCostUsd:0.125,costUnknown:true}})};
+ const x=setup({model});
+ try {
+  const {decision}=await x.runtime.step('partial-cost');
+  const expected={inputTokens:7,outputTokens:3,unknown:false,knownCostUsd:0.125,costUnknown:true};
+  assert.deepEqual(decision.usage,expected);
+  assert.deepEqual(x.store.getArtifact(digest(decision)).usage,expected);
  } finally {await x.runtime.close();x.store.close();}
 });
 const fakeRun=(store,id='run')=>store.createRun({id,scopeId:'scope',baseReleaseDigest:store.activeRelease('scope'),researchSnapshotId:store.snapshot('scope',Date.now()),evaluationProtocolDigest:store.putArtifact('protocol',{id:'p'},'private'),status:'created',data:{}});
@@ -249,7 +261,7 @@ test('model timeout stops the continuous loop and a late answer cannot execute',
     assert.equal(x.runtime.status().failure.code,'MODEL_TIMEOUT');
     assert.equal(x.store.events().filter(event=>event.type==='decision').length,1);
     const late=x.store.events().find(event=>event.type==='decision.late_model_result').data;
-    assert.deepEqual(late.usage,usage);assert.equal(late.decisionId,x.runtime.status().failure.decisionId);
+    assert.deepEqual(late.usage,{...usage,knownCostUsd:0,costUnknown:false});assert.equal(late.decisionId,x.runtime.status().failure.decisionId);
     assert.equal(x.store.events().find(event=>event.type==='decision').data.usage.unknown,true);
   }finally{await x.runtime.close();x.store.close();}
 });

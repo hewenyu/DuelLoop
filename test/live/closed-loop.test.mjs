@@ -47,7 +47,7 @@ test('LIVE R2: autonomous pi proposal → independent real-Jev evaluation → re
   return rawModel.score({...input,signal:AbortSignal.any([input.signal,t.signal])});
  }};
  const provider=new PiResearchProvider({provider:process.env.DUELLOOP_PI_PROVIDER,model:process.env.DUELLOOP_PI_MODEL,apiKeyEnv:piKeyEnv,baseURL:process.env.DUELLOOP_PI_BASE_URL,maxTurns:positiveEnv('DUELLOOP_LIVE_PI_MAX_TURNS',16)});
- const abortableProvider={id:provider.id,kind:provider.kind,run:input=>provider.run({...input,signal:AbortSignal.any([input.signal,t.signal])})};
+ const abortableProvider={id:provider.id,kind:provider.kind,run:input=>provider.run({...input,signal:AbortSignal.any([input.signal,t.signal])}),releaseSession:id=>provider.releaseSession(id)};
  const domain=new KuhnPokerDomain({applicationId:'live-closed-loop',scopeId,seed:811,opponentId:'calling',knowledgeStateMode:'frozen',knowledge:{},decisionTimeoutMs:maxDecisionMs});
  const store=new SqliteStore(join(experimentRoot,'evidence.sqlite'));
  const runtime=new DuelLoop({applicationId:'live-closed-loop',domain,model,store,mode:'simulation',executionOwner:'framework',maxDecisionMs,executionReserveMs:100,randomSeed:'r2-controlled-v1'});

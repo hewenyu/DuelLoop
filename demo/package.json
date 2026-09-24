@@ -5,5 +5,5 @@
   "type": "module",
   "engines": { "node": ">=24.0.0" },
   "scripts": { "start": "node app.mjs", "check": "node conformance.mjs" },
-  "dependencies": { "duelloop": "file:../duelloop-0.2.0.tgz" }
+  "dependencies": { "duelloop": "file:../duelloop-0.2.1.tgz" }
 }

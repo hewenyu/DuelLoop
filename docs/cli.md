@@ -126,7 +126,7 @@ CLI 创建的评价协议为 `3.0`：`maxP95DecisionComputeMs` 衡量模拟器�
 
 此对象替换配置中的整个 `research` 字段；运行模式需允许真实研究，例如 `simulation`。示例与仓库 `.env.example` 的 DeepSeek 配置一致，CLI 命令仍需继承已配置的环境变量或使用上述 Node.js 加载方式。模型仅支持锁定 pi SDK 内置目录；账号是否支持需另行验证。团队配置把 `mode` 改为 `team`，为 `roles` 补齐 `adversary` 和 `integrator`，每个角色同样填写 provider、model、apiKeyEnv、maxTurns；可以选择相同或不同模型。
 
-单模型在一个任务内跨阶段复用会话；团队每个角色使用隔离会话。受控工具和资源加载由框架指定，不加载用户本机 AGENTS、扩展、提示模板、文件编辑或命令工具。角色会话保存在进程内，进程中断后不自动重放未知费用的请求；通过 `research-recover` 将中断任务收敛为终态，再建立新任务。
+单模型在一个任务内跨阶段复用会话；团队每个角色使用隔离会话。受控工具和资源加载由框架指定，不加载用户本机 AGENTS、扩展、提示模板、文件编辑或命令工具。角色会话在研究结束且在途请求结算后释放。跨实例取消会阻止 Pi 继续发送请求；进程中断后不自动重放未知费用的请求。`research-recover` 对 `validated_pending_release` 或旧版成功但未登记发布的任务，只重试本地发布、不重复评估；其他无法确认远端结果的中断任务收敛为终态。
 
 ```sh
 duelloop research-create --config ./my-app/duelloop.json --id study-001
@@ -170,7 +170,7 @@ duelloop research-worker --config ./my-app/duelloop.json
 | `research-worker` | 按显式 trigger 持续触发研究，SIGINT/SIGTERM 停止 |
 | `research-status` | 可选 `--id ID`；查询任务或当前作用域列表 |
 | `research-cancel` | `--id ID`；持久记录取消意图；终态不被复活 |
-| `research-recover` | `--id ID`；收敛取消或中断任务，不重放远端调用 |
+| `research-recover` | `--id ID`；恢复已验证的本地发布，或收敛取消/中断任务，不重放远端调用 |
 | `evaluate` | `--candidate PATH`；只使用开发协议，保存开发报告，无发布资格 |
 | `activate` | `--release DIGEST`；按模式、验证与领域边界显式激活 |
 | `pause` / `resume` | 暂停/恢复策略激活；当前动作循环继续使用有效版本 |
@@ -200,7 +200,7 @@ duelloop research-worker --config ./my-app/duelloop.json
 | `0` | 操作完成；`no_change` 也为合法完成 |
 | `1` | 存储、内部错误、失败的恢复/完整性结果或研究错误 |
 | `2` | 参数、配置、策略、版本兼容或能力错误 |
-| `3` | 冲突、状态过期、未知执行、访问拒绝、激活延期或等待新评价协议 |
+| `3` | 冲突、状态过期、未知执行、访问拒绝、激活延期、等待新评价协议或待登记发布 |
 | `4` | 验证拒绝，实验失败或证据不足 |
 | `5` | 模型错误、超时或预算耗尽 |
 | `130` | 用户取消或收到终止信号 |

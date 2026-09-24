@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { invariant } from './errors.js';
+import { accumulateModelUsage, emptyModelUsage } from './usage.js';
 import { digest, seededRandom, withDeadline } from './utils.js';
 import { buildQuestions, compileStrategy, evaluateAnswers } from './strategy.js';
 import type { ActionCommand, CandidateAction, DecisionPolicy, DomainDefinition, EvaluationAdapter, EvaluationEpisode, ExecutionReceipt, Features, FeedbackEvent, Observation, StrategyPackage } from './types.js';
@@ -233,7 +234,7 @@ async function simulate(factory: (options: SimulationOptions) => DomainDefinitio
     knowledge: structuredClone(input.knowledge), knowledgeStateMode: input.knowledgeStateMode, decisionTimeoutMs: maxDecisionMs, sessionId: `evaluation:${input.seed}` });
   const strategy = compileStrategy(input.strategy, domain).strategy;
   const random = seededRandom(`${input.seed}:selection`);
-  const result: EvaluationEpisode = { reward: 0, decisions: 0, decisionComputeLatenciesMs: [], modelCalls: 0, usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 } };
+  const result: EvaluationEpisode = { reward: 0, decisions: 0, decisionComputeLatenciesMs: [], modelCalls: 0, usage: emptyModelUsage() };
   const settled = new Set<string>();
   // Every call constructs independent domain/opponent/knowledge state, including paired baseline/candidate calls.
   while (settled.size < input.trajectories) {
@@ -243,10 +244,7 @@ async function simulate(factory: (options: SimulationOptions) => DomainDefinitio
     const request = buildQuestions(strategy, observation, candidates, domain); result.modelCalls++;
     const response = await withDeadline(observation.deadline - reserve, signal => input.model.score({ state: request.state, questions: request.questions, signal }), input.signal);
     invariant(response.model === input.model.id || input.model.kind === 'fixture', 'VERSION_INCOMPATIBLE', 'Evaluation model returned a different version');
-    if (response.usage) {
-      result.usage!.inputTokens! += response.usage.inputTokens ?? 0; result.usage!.outputTokens! += response.usage.outputTokens ?? 0;
-      result.usage!.costUsd! += response.usage.costUsd ?? 0; if (response.usage.unknown) result.usage!.unknown = true;
-    } else result.usage!.unknown = true;
+    accumulateModelUsage(result.usage!, response.usage);
     const action = evaluateAnswers(strategy, observation, candidates, response.answers, timing.randomSeed === undefined ? random : seededRandom(`${timing.randomSeed}:${observation.trajectoryId}:${observation.revision}`)).action;
     invariant(!input.signal.aborted, 'CANCELLED', 'Evaluation cancelled');
     result.decisions++; result.decisionComputeLatenciesMs.push(Date.now() - started);

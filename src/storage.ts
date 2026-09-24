@@ -5,15 +5,16 @@ import { hostname } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { invariant, DuelLoopError } from './errors.js';
 import { canonicalize, digest, jsonValue } from './utils.js';
-import type { Artifact, BehaviorDependencies, DecisionRecord, DuelLoopStore, EvaluationProtocol, ExecutionMode, ExecutionReceipt, FeedbackEvent, Intent, JournalEvent, Json, ReleaseBinding, ResearchRun, RunStatus, ScopeStatus, ValidationReport } from './types.js';
+import type { Artifact, BehaviorDependencies, CandidateSubmission, DecisionRecord, DuelLoopStore, EvaluationProtocol, ExecutionMode, ExecutionReceipt, FeedbackEvent, Intent, JournalEvent, Json, ReleaseBinding, ResearchRun, RunStatus, ScopeStatus, ValidationReport } from './types.js';
 
 const TERMINAL = new Set<RunStatus>(['cancelled','no_change','budget_exhausted','completed_passed','completed_failed','completed_inconclusive','error','waiting_protocol']);
-const ACTIVE_RUN_SQL="status IN ('created','researching','development_evaluating','candidate_locked','final_evaluating','cancel_requested')";
+const ACTIVE_RUN_SQL="status IN ('created','researching','development_evaluating','candidate_locked','final_evaluating','validated_pending_release','cancel_requested')";
 const TRANSITIONS: Record<string, string[]> = {
   created:['researching','cancel_requested','error','waiting_protocol'], researching:['development_evaluating','candidate_locked','no_change','budget_exhausted','cancel_requested','error','waiting_protocol'],
   development_evaluating:['researching','candidate_locked','budget_exhausted','cancel_requested','error','waiting_protocol'],
   candidate_locked:['final_evaluating','cancel_requested','budget_exhausted','error','waiting_protocol'],
-  final_evaluating:['completed_passed','completed_failed','completed_inconclusive','cancel_requested','budget_exhausted','error','waiting_protocol'], cancel_requested:['cancelled'],
+  final_evaluating:['validated_pending_release','completed_passed','completed_failed','completed_inconclusive','cancel_requested','budget_exhausted','error','waiting_protocol'],
+  validated_pending_release:['completed_passed','cancel_requested','error'],cancel_requested:['cancelled'],
 };
 export interface SqliteStoreOptions {
   /** Logical SQLite database page limit for this connection; excludes WAL and temporary files. No default quota. */
@@ -354,6 +355,41 @@ export class SqliteStore implements DuelLoopStore {
       run.counters[counter]=n;run.revision++;run.updatedAt=Date.now(); this.db.prepare('UPDATE runs SET revision=?,data=? WHERE id=?').run(run.revision,canonicalize(run),id);
       if(counter==='modelCalls'&&previousCount===0&&n===1&&run.data.trigger&&typeof run.data.trigger==='object'&&!Array.isArray(run.data.trigger))this.appendEvent('research.triggered',run.scopeId,{...run.data.trigger,runId:id});
       return n;
+    });
+  }
+  /** Persist the final report and its recoverable publication state in one transaction. */
+  recordFinalValidation(id:string,report:ValidationReport,evidenceDigest?:string):ResearchRun {
+    return this.transaction(()=>{
+      const run=this.getRun(id);
+      invariant(run.status==='final_evaluating'&&typeof run.data.submissionDigest==='string','CONFLICT','Final validation requires a locked evaluating run');
+      const candidate=this.getArtifact<CandidateSubmission>(run.data.submissionDigest);
+      invariant(report.stage==='final'&&report.candidateDigest===digest(candidate.strategy)&&report.baseReleaseDigest===run.baseReleaseDigest&&report.protocolDigest===run.evaluationProtocolDigest,'VALIDATION_REJECTED','Final report differs from the locked research bindings');
+      if(evidenceDigest)this.getArtifact(evidenceDigest,{allowPrivate:true});
+      const validationDigest=this.putArtifact('validation_report',report,'private');
+      const status=report.status==='passed'?'validated_pending_release':`completed_${report.status}` as RunStatus;
+      const updated=this.transitionRun(id,['final_evaluating'],status,{validationDigest,...(evidenceDigest?{evidenceDigest}:{})});
+      this.appendEvent('research.final_conclusion',run.scopeId,{runId:id,status:report.status,modelKind:report.modelKind});
+      return updated;
+    });
+  }
+  /** No model or holdout work: retrying this local transaction is idempotent. */
+  finalizeResearchPublication(id:string):ResearchRun {
+    return this.transaction(()=>{
+      let run=this.getRun(id);
+      invariant(run.status==='validated_pending_release'||run.status==='completed_passed','CONFLICT','Research has no successful validation awaiting publication');
+      invariant(typeof run.data.validationDigest==='string'&&typeof run.data.submissionDigest==='string','VALIDATION_REJECTED','Successful research is missing its durable validation or candidate');
+      const validationDigest=run.data.validationDigest;
+      const report=this.getArtifact<ValidationReport>(validationDigest,{allowPrivate:true});
+      const candidate=this.getArtifact<CandidateSubmission>(run.data.submissionDigest);
+      invariant(report.status==='passed'&&report.stage==='final'&&report.candidateDigest===digest(candidate.strategy)&&report.baseReleaseDigest===run.baseReleaseDigest&&report.protocolDigest===run.evaluationProtocolDigest&&candidate.researchRunId===id&&candidate.researchSnapshotId===run.researchSnapshotId,'VALIDATION_REJECTED','Publication does not match the validated research candidate');
+      const strategyDigest=this.putArtifact('strategy',candidate.strategy);
+      if(run.status==='validated_pending_release')run=this.transitionRun(id,['validated_pending_release'],'completed_passed');
+      const releaseDigest=this.registerRelease({strategyDigest,dependencies:report.dependencies,scopeId:run.scopeId,expectedActiveDigest:run.baseReleaseDigest,validationDigest,source:'research',researchRunId:id});
+      if(run.data.releaseDigest===releaseDigest)return run;
+      const updated={...run,revision:run.revision+1,updatedAt:Date.now(),data:{...run.data,releaseDigest}};
+      this.db.prepare('UPDATE runs SET revision=?,data=? WHERE id=?').run(updated.revision,canonicalize(updated),id);
+      this.appendEvent('research.release_registered',run.scopeId,{runId:id,releaseDigest,validationDigest});
+      return updated;
     });
   }
   cancelRun(id:string):ResearchRun { return this.transaction(()=>{const r=this.getRun(id); if(TERMINAL.has(r.status)||r.status==='cancel_requested')return r;return this.transitionRun(id,[r.status],'cancel_requested');}); }

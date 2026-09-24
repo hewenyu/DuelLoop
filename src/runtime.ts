@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { DuelLoopError, invariant } from './errors.js';
 import { buildQuestions, compileStrategy, evaluateAnswers, validateScoreAnswer } from './strategy.js';
 import { canonicalize, digest, seededRandom, withDeadline } from './utils.js';
+import { normalizeModelUsage } from './usage.js';
 import type { ActionCommand, BehaviorDependencies, CandidateAction, DecisionModel, DecisionRecord, DomainDefinition, DuelLoopStore, ExecutionMode, ExecutionReceipt, FeedbackEvent, JournalEvent, ModelUsage, Observation, StrategyPackage } from './types.js';
 
 export interface DuelLoopOptions {
@@ -11,12 +12,7 @@ export interface DuelLoopOptions {
 }
 export const RUNTIME_VERSION = 'duelloop-runtime-4';
 function measuredUsage(value:unknown):ModelUsage {
-  const usage=value&&typeof value==='object'?value as Record<string,unknown>:{};
-  const known=(key:string)=>Number.isSafeInteger(usage[key])&&(usage[key] as number)>=0;
-  return {unknown:usage.unknown===true||!known('inputTokens')||!known('outputTokens'),
-    ...(known('inputTokens')?{inputTokens:usage.inputTokens as number}:{}),
-    ...(known('outputTokens')?{outputTokens:usage.outputTokens as number}:{}),
-    ...(typeof usage.costUsd==='number'&&Number.isFinite(usage.costUsd)&&usage.costUsd>=0?{costUsd:usage.costUsd}:{})};
+  return normalizeModelUsage(value&&typeof value==='object'?value as ModelUsage:undefined);
 }
 export function decisionPolicyRuntimeVersion(timing:{maxDecisionMs?:number;executionReserveMs?:number;randomSeed?:string}={}):string {
   const policy={maxDecisionMs:timing.maxDecisionMs??5000,executionReserveMs:timing.executionReserveMs??25,randomSeed:timing.randomSeed??null};

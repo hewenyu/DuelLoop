@@ -21,7 +21,7 @@ npm start
 npm run check
 ```
 
-`package.json` 使用 `../duelloop-0.2.0.tgz`；升级 SDK 时替换为对应发布版本或本地 tarball。整个目录可以复制到其他位置，将该依赖地址改为 tarball 的实际位置后独立安装。
+`package.json` 使用 `../duelloop-0.2.1.tgz`；升级 SDK 时替换为对应发布版本或本地 tarball。整个目录可以复制到其他位置，将该依赖地址改为 tarball 的实际位置后独立安装。
 
 `app.mjs` 演示两种环境：官方 Kuhn 适配器，以及应用自定义竞价环境。各应用注入独立领域、策略与存储，初始化发布，再反复调用 `step()`。执行与反馈通过 SDK 持久记录。这个演示使用内存数据库；长期应用改用 `new SqliteStore('./application.sqlite')`，并为自己的环境实现可恢复状态和执行状态核对。
 

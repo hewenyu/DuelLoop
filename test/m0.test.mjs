@@ -1,9 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { episode, makeFixtureModel } from '../scripts/m0.mjs';
+import { episode, makeFixtureModel, usageAccumulator, addUsage } from '../scripts/m0.mjs';
 
 const options = { hands: 4, timeoutMs: 5000, maxCalls: 100 };
 const knownUsage = { inputTokens: 7, outputTokens: 3, costUsd: 0.125, unknown: false };
+
+test('M0 usage preserves partial cost subtotals independently from token completeness', () => {
+  const total = usageAccumulator();
+  addUsage(total, { inputTokens: 7, outputTokens: 3, costUnknown: true, knownCostUsd: 0.125 });
+  addUsage(total, { costUsd: 0.25 });
+  assert.deepEqual(total, { inputTokens: 7, outputTokens: 3, knownCostUsd: 0.375, unknownTokenUsage: true, unknownCost: true });
+  const priced = usageAccumulator();
+  addUsage(priced, { costUsd: 0, unknown: true });
+  assert.equal(priced.unknownTokenUsage, true);
+  assert.equal(priced.unknownCost, false);
+  addUsage(priced, { inputTokens: 1, outputTokens: 1, costUsd: Infinity });
+  assert.equal(priced.unknownCost, true);
+  assert.equal(priced.knownCostUsd, 0);
+});
 
 async function runLowConfidenceResponse(path, usage) {
   const model = makeFixtureModel();

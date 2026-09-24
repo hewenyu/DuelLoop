@@ -162,7 +162,7 @@ test('CLI rollback consults the external domain activation checkpoint', async ()
 });
 
 test('research creation/cancellation/recovery is persistent and offline mode blocks paid research', async () => {
-  await fixture(async ({ raw, save, command }) => {
+  await fixture(async ({ path, raw, save, command }) => {
     await command('run','--steps','3');
     raw.research = { mode:'single', maxRounds:1, budget:{maxWallTimeSeconds:60,maxTokensTotal:4096,maxModelCalls:3,maxDecisionModelCalls:100,maxRepairAttempts:0},
       roles:{researcher:{provider:'openai',model:'gpt-4o',apiKeyEnv:'UNSET_RESEARCH_TEST_KEY',maxTurns:4}} };
@@ -172,6 +172,11 @@ test('research creation/cancellation/recovery is persistent and offline mode blo
     assert.equal((await command('research-cancel','--id',run.id)).status, 'cancel_requested');
     assert.equal((await command('research-recover','--id',run.id)).status, 'cancelled');
     assert.equal((await command('research-status','--id',run.id)).status, 'cancelled');
+    const recovered = spawnSync(process.execPath,[resolve('dist/cli.js'),'research-recover','--config',path,'--id',run.id],{encoding:'utf8'});
+    assert.equal(recovered.status,130,recovered.stderr);
+    const inspected = spawnSync(process.execPath,[resolve('dist/cli.js'),'research-status','--config',path,'--id',run.id],{encoding:'utf8'});
+    assert.equal(inspected.status,0,inspected.stderr);
+    assert.equal(JSON.parse(inspected.stdout).data.status,'cancelled');
   });
 });
 

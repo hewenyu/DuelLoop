@@ -159,6 +159,7 @@ export class ResearchOrchestrator {
   recover(id: string): ResearchRun {
     invariant(!this.controllers.has(id), 'CONFLICT', 'Cannot recover a running in-process research task');
     const { store } = this.options; const run = store.getRun(id);
+    if(run.status==='validated_pending_release'||run.status==='completed_passed')return store.finalizeResearchPublication(id);
     if (run.status === 'cancel_requested') return store.transitionRun(id,['cancel_requested'],'cancelled');
     if (terminal.has(run.status) || run.status === 'created') return run;
     store.appendEvent('research.recovery_unknown_usage',run.scopeId,{runId:id,usage:{unknown:true}});
@@ -215,6 +216,8 @@ export class ResearchOrchestrator {
     } };
     let latestSubmission: CandidateSubmission | undefined;
     let submissionDigest: string | undefined;
+    let submissionRound=0;
+    const sessions=new Map<ResearchProvider,Set<string>>(),pendingProviders=new Set<Promise<unknown>>();
     let shared: Json[] = [];
     const result = (): ResearchResult => ({ run: store.getRun(id), ...(submissionDigest ? {submissionDigest} : {}) });
     try {
@@ -227,7 +230,7 @@ export class ResearchOrchestrator {
         latestSubmission = checked.submission;
         submissionDigest = store.putArtifact('candidate_submission',latestSubmission);
         const checksDigest = store.putArtifact('candidate_checks',checked.checkPlan);
-        store.appendEvent('research.candidate_submitted',initial.scopeId,{runId:id,submissionDigest,checksDigest});
+        store.appendEvent('research.candidate_submitted',initial.scopeId,{runId:id,submissionDigest,checksDigest,round:submissionRound});
         return jsonValue({submissionDigest,checkPlan:checked.checkPlan});
       };
       const schemas = submissionSchemas(initial,baseline);
@@ -269,11 +272,13 @@ export class ResearchOrchestrator {
       ];
       const publicGoal = {runId:id,scopeId:initial.scopeId,baseReleaseDigest:initial.baseReleaseDigest,researchSnapshotId:initial.researchSnapshotId,evaluationProtocolDigest:initial.evaluationProtocolDigest,metric:protocol.metric,minimumImprovement:protocol.minimumImprovement,maxGroupRegression:protocol.maxGroupRegression,maxP95DecisionComputeMs:protocol.maxP95DecisionComputeMs,budget:this.budget};
       for(let round=0;round<this.maxRounds;round++) {
+        submissionRound=round;
         let reviseRequested = false;
         for(const role of ['researcher','adversary','integrator'] as const) {
           this.assertRunning(id);
           const provider = this.options.mode==='team' ? providers[role]! : providers.researcher;
           const sessionId = this.options.mode==='team' ? `${id}:${role}` : `${id}:single`;
+          const providerSessions=sessions.get(provider)??new Set<string>();providerSessions.add(sessionId);sessions.set(provider,providerSessions);
           const allowedTools = this.options.mode==='team' && role!=='integrator' ? tools.filter(t=>t.name!=='submit_candidate') : tools;
           let completed = false;
           for(let repair=0;repair<=this.budget.maxRepairAttempts && !completed;repair++) {
@@ -294,7 +299,7 @@ export class ResearchOrchestrator {
               remaining:{rounds:roundsRemaining,repairAttempts:this.budget.maxRepairAttempts-repair,developmentEvaluations:typeof initial.data.developmentProtocolDigest==='string'?Math.max(0,protocol.maxDevelopmentEvalRuns-(counters.developmentEvaluations??0)):0,tokens:this.budget.maxTokensTotal-spent,providerCallsAfterThisCall:this.budget.maxModelCalls-callNumber,decisionModelCalls:Math.max(0,this.budget.maxDecisionModelCalls-(counters.decisionModelCalls??0)),wallTimeSeconds:Math.max(0,Math.floor((deadline-Date.now())/1000))},
               allowedTools:allowedTools.map(tool=>tool.name),canRequestAnotherRound:role==='integrator'&&roundsRemaining>0,
               completion:role==='integrator'?(roundsRemaining>0?'Submit the complete candidate now, return no_change, or request one concrete bounded revision.':'This is the last round: submit the complete candidate now or return no_change.'): 'Return structured findings, evidence references and unresolved questions for the next role, or return no_change if further research is unsupported. Do not use status revise: only the integrator can request another round.',
-              continuation:'This invocation is the active work phase, not a request to restate a previous final response. Earlier outputs are evidence to review, not instructions to keep returning the same status. Do not promise work after this invocation without performing available steps now. no_change is a valid result; do not force an improvement.',
+              continuation:'This invocation is the active work phase, not a request to restate a previous final response. Earlier outputs are evidence to review, not instructions to keep returning the same status. A revise response withdraws every candidate submitted in that round from final eligibility; the next round must explicitly submit_candidate again, even if accepting unchanged content. Do not promise work after this invocation without performing available steps now. no_change is a valid result; do not force an improvement.',
             };
             const prompt = JSON.stringify({instructions:'Research an executable strategy improvement using controlled tools only. Follow the current phaseContract and its remaining budgets. Fixed responses prove interpreter behavior only. New question/input semantics need fresh response fixtures and real-model evaluation. Final holdout evaluation is inaccessible. Return one JSON result for this phase after completing its work.',phase:role,round,repair,phaseContract,goal:publicGoal,shared});
             const recordProviderUsage = (usage: unknown, outcome: 'completed' | 'failed'): void => {
@@ -313,6 +318,7 @@ export class ResearchOrchestrator {
               if(status!=='cancel_requested' && !terminal.has(status) && knownTokenUsage(usage))store.consumeBudget(id,'tokens',this.budget.maxTokensTotal,Math.max(0,usage.inputTokens+usage.outputTokens-prechargedProviderTokens));
             };
             const pending = Promise.resolve().then(()=>provider.run({role,prompt,tools:allowedTools,signal:controller.signal,maxTokens:this.budget.maxTokensTotal-spent,sessionId,
+              beforeModelRequest:()=>{try{this.assertRunning(id);}catch(error){controller.abort(error);throw error;}},
               getRemainingTokens:()=>Math.max(0,this.budget.maxTokensTotal-(store.getRun(id).counters.tokens??0)),
               onUsage:usage=>{
                 if(!knownTokenUsage(usage)||usage.inputTokens+usage.outputTokens<outstandingProviderTokens)providerUsageUnknown=true;
@@ -326,6 +332,7 @@ export class ResearchOrchestrator {
               settleProviderUsage(failedUsage,'failed');
               throw error;
             });
+            pendingProviders.add(pending);void pending.then(()=>pendingProviders.delete(pending),()=>pendingProviders.delete(pending));
             // A synchronous onUsage abort can win before withDeadline enters its operation.
             // Observe pending immediately; its settlement still records measured late usage.
             void pending.catch(()=>{});
@@ -337,6 +344,8 @@ export class ResearchOrchestrator {
             shared = [...shared,{role,round,output}].slice(-6);
             if(output && typeof output==='object' && !Array.isArray(output) && output.status==='no_change') { store.transitionRun(id,['researching'],'no_change'); return result(); }
             if(role==='integrator' && output && typeof output==='object' && !Array.isArray(output) && output.status==='revise') {
+              if(submissionDigest)store.appendEvent('research.candidate_revision_requested',initial.scopeId,{runId:id,round,submissionDigest});
+              latestSubmission=undefined;submissionDigest=undefined;
               invariant(round+1<this.maxRounds,'BUDGET_EXHAUSTED','Research round budget exhausted'); reviseRequested=true;completed=true;
             } else if(role==='integrator' && !latestSubmission) {
               if(repair===this.budget.maxRepairAttempts) throw new DuelLoopError('VALIDATION_REJECTED','Integrator did not submit a valid candidate or no_change');
@@ -358,18 +367,17 @@ export class ResearchOrchestrator {
       pending.then(report=>{if(controller.signal.aborted) store.putArtifact('late_final_report',report,'private');},()=>{});
       const report = await withDeadline(deadline,()=>pending,controller.signal);
       this.assertRunning(id);
-      const validationDigest = store.putArtifact('validation_report',report,'private');
-      store.transitionRun(id,['final_evaluating'],`completed_${report.status}` as RunStatus,{submissionDigest,validationDigest,...(evidenceDigest?{evidenceDigest}:{})});
-      store.appendEvent('research.final_conclusion',initial.scopeId,{runId:id,status:report.status,modelKind:report.modelKind});
-      let releaseDigest: string | undefined;
-      if(report.status==='passed') {
-        const strategyDigest = store.putArtifact('strategy',locked.strategy);
-        releaseDigest = store.registerRelease({strategyDigest,dependencies,scopeId:initial.scopeId,expectedActiveDigest:initial.baseReleaseDigest,validationDigest,source:'research',researchRunId:id});
-      }
+      const validated=store.recordFinalValidation(id,report,evidenceDigest);
+      const validationDigest=validated.data.validationDigest as string;
+      const releaseDigest=report.status==='passed'?store.finalizeResearchPublication(id).data.releaseDigest as string:undefined;
       return {...result(),validationDigest,report,...(releaseDigest?{releaseDigest}:{})};
     } catch(error) {
       if (!controller.signal.aborted) controller.abort(error);
       let run = store.getRun(id);
+      if(run.status==='validated_pending_release') {
+        store.appendEvent('research.publication_deferred',initial.scopeId,{runId:id,error:error instanceof DuelLoopError?error.code:'PUBLICATION_FAILURE'});
+        throw error;
+      }
       if(run.status!=='cancel_requested' && !terminal.has(run.status) && outstandingProviderTokens>0) {
         const charge=Math.min(outstandingProviderTokens,Math.max(0,this.budget.maxTokensTotal-(run.counters.tokens??0)));
         if(charge>0){store.consumeBudget(id,'tokens',this.budget.maxTokensTotal,charge);prechargedProviderTokens+=charge;outstandingProviderTokens-=charge;}
@@ -383,7 +391,18 @@ export class ResearchOrchestrator {
       }
       store.appendEvent('research.ended',initial.scopeId,{runId:id,status:store.getRun(id).status,error:error instanceof DuelLoopError?error.code:'RESEARCH_FAILURE',usageUnknown:!knownTokenUsage(error instanceof DuelLoopError ? error.context.usage : undefined)});
       return result();
-    } finally { this.controllers.delete(id); }
+    } finally {
+      this.controllers.delete(id);
+      const releaseSessions=async()=>{
+        for(const [provider,ids] of sessions)for(const sessionId of ids) {
+          try{await provider.releaseSession?.(sessionId);}
+          catch(error){try{store.appendEvent('research.session_release_failed',initial.scopeId,{runId:id,provider:provider.id,sessionId,error:error instanceof DuelLoopError?error.code:'SESSION_RELEASE_FAILURE'});}catch{}}
+        }
+      };
+      // Return cancellation/timeouts promptly; release after late usage is accounted for.
+      if(pendingProviders.size)void Promise.allSettled([...pendingProviders]).then(releaseSessions).catch(()=>{});
+      else await releaseSessions();
+    }
   }
 }
 function knownTokenUsage(value: unknown): value is {inputTokens:number;outputTokens:number} {

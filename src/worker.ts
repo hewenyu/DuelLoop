@@ -48,13 +48,33 @@ export class ResearchWorker {
     if(data?.state!=='waiting_protocol'||data.protocolDigest!==protocolDigest)
       store.appendEvent('research.worker_state',scopeId,{state:'waiting_protocol',reason:'holdout_unavailable',protocolDigest},'private');
   }
+  private async notifyRelease(result:ResearchResult):Promise<void> {
+    const {store,scopeId}=this.options;
+      if(result.releaseDigest&&!this.stopping&&this.options.onRelease) {
+        try {await this.options.onRelease(result.releaseDigest);}
+        catch(error) {
+          const code=error instanceof DuelLoopError?error.code:'RELEASE_NOTIFICATION_ERROR';
+          const state=code==='ACTIVATION_DEFERRED'?'deferred':['CONFLICT','VALIDATION_REJECTED','VERSION_INCOMPATIBLE'].includes(code)?'invalid':'error';
+          store.appendEvent('research.release_notification',scopeId,{releaseDigest:result.releaseDigest,state,reason:code});
+          if(state==='invalid')store.appendEvent('release.invalid',scopeId,{releaseDigest:result.releaseDigest,reason:code});
+          if(state==='error')throw error;
+        }
+      }
+  }
   async tick():Promise<ResearchResult|null>{
     if(this.stopping||this.running)return null;
     this.running=true;
     const protocols=this.protocols;
     try{
       const {store,scopeId,orchestrator}=this.options;
-      if(store.activeRun(scopeId))return null;
+      const active=store.activeRun(scopeId);
+      if(active?.status==='validated_pending_release') {
+        this.activeRun=active.id;this.state='running';
+        const recovered=orchestrator.recover(active.id);
+        const result:ResearchResult={run:recovered,...(typeof recovered.data.releaseDigest==='string'?{releaseDigest:recovered.data.releaseDigest}:{})};
+        this.state=this.stopping?'stopped':'idle';await this.notifyRelease(result);return result;
+      }
+      if(active)return null;
       if(orchestrator.protocolAvailability(protocols.protocol).remaining===0){this.waiting(protocols.protocol);return null;}
       if(this.state==='waiting_protocol')store.appendEvent('research.worker_state',scopeId,{state:'idle',protocolDigest:digest(protocols.protocol)},'private');
       this.state='idle';
@@ -75,16 +95,7 @@ export class ResearchWorker {
       const result=await orchestrator.run(run.id);
       if(result.run.status==='waiting_protocol'){this.waiting(protocols.protocol);return result;}
       this.state=this.stopping?'stopped':'idle';
-      if(result.releaseDigest&&!this.stopping&&this.options.onRelease) {
-        try {await this.options.onRelease(result.releaseDigest);}
-        catch(error) {
-          const code=error instanceof DuelLoopError?error.code:'RELEASE_NOTIFICATION_ERROR';
-          const state=code==='ACTIVATION_DEFERRED'?'deferred':['CONFLICT','VALIDATION_REJECTED','VERSION_INCOMPATIBLE'].includes(code)?'invalid':'error';
-          store.appendEvent('research.release_notification',scopeId,{releaseDigest:result.releaseDigest,state,reason:code});
-          if(state==='invalid')store.appendEvent('release.invalid',scopeId,{releaseDigest:result.releaseDigest,reason:code});
-          if(state==='error')throw error;
-        }
-      }
+      await this.notifyRelease(result);
       return result;
     }catch(error){
       if(error instanceof DuelLoopError&&error.code==='HOLDOUT_UNAVAILABLE'){this.waiting(protocols.protocol);return null;}

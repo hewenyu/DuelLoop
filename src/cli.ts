@@ -272,14 +272,15 @@ async function main(): Promise<void> {
   try {
     const result = await executeCli(process.argv.slice(2), { signal: controller.signal });
     process.stdout.write(JSON.stringify({ ok: true, command: process.argv[2] ?? 'help', data: jsonValue(result) }) + '\n');
-    const outcome = result as { valid?: boolean; ok?: boolean; run?: { status: string }; report?: { status: string } };
+    const outcome = result as { valid?: boolean; ok?: boolean; status?: string; run?: { status: string }; report?: { status: string } };
+    const status = outcome.run?.status ?? (process.argv[2] === 'research-recover' ? outcome.status : undefined);
     if (outcome.valid === false) process.exitCode = 2;
     else if (outcome.ok === false) process.exitCode = 1;
-    else if (outcome.run?.status === 'cancelled') process.exitCode = 130;
-    else if (outcome.run?.status === 'budget_exhausted') process.exitCode = 5;
-    else if (outcome.run?.status === 'waiting_protocol') process.exitCode = 3;
-    else if (outcome.run?.status === 'error') process.exitCode = 1;
-    else if (['completed_failed','completed_inconclusive'].includes(outcome.run?.status ?? '') || ['failed','inconclusive'].includes(outcome.report?.status ?? '')) process.exitCode = 4;
+    else if (status === 'cancelled') process.exitCode = 130;
+    else if (status === 'budget_exhausted') process.exitCode = 5;
+    else if (['waiting_protocol','validated_pending_release'].includes(status ?? '')) process.exitCode = 3;
+    else if (status === 'error') process.exitCode = 1;
+    else if (['completed_failed','completed_inconclusive'].includes(status ?? '') || ['failed','inconclusive'].includes(outcome.report?.status ?? '')) process.exitCode = 4;
     if (controller.signal.aborted) process.exitCode = 130;
   } catch (error) {
     const failure = controller.signal.aborted ? new DuelLoopError('CANCELLED', 'Command cancelled') : error;

@@ -46,10 +46,18 @@ export function configuredModel(fixture) {
 }
 export function usageAccumulator() {return {inputTokens:0,outputTokens:0,knownCostUsd:0,unknownTokenUsage:false,unknownCost:false};}
 export function addUsage(total,usage) {
- if(!usage || usage.unknown || usage.inputTokens===undefined || usage.outputTokens===undefined)total.unknownTokenUsage=true;
- total.inputTokens+=usage?.inputTokens??0;total.outputTokens+=usage?.outputTokens??0;
- if(usage?.costUsd===undefined || usage?.unknown)total.unknownCost=true;
- total.knownCostUsd+=usage?.costUsd??0;
+ const validCost=value=>typeof value==='number'&&Number.isFinite(value)&&value>=0;
+ for(const key of ['inputTokens','outputTokens']) {
+  const value=usage?.[key];
+  if(Number.isSafeInteger(value)&&value>=0&&Number.isSafeInteger(total[key]+value))total[key]+=value;
+  else total.unknownTokenUsage=true;
+ }
+ if(usage?.unknown)total.unknownTokenUsage=true;
+ const complete=validCost(usage?.costUsd)&&!usage?.costUnknown&&(usage?.knownCostUsd===undefined||validCost(usage.knownCostUsd)&&usage.knownCostUsd===usage.costUsd);
+ const known=validCost(usage?.knownCostUsd)?usage.knownCostUsd:validCost(usage?.costUsd)?usage.costUsd:0;
+ if(validCost(total.knownCostUsd+known))total.knownCostUsd+=known;
+ else total.unknownCost=true;
+ if(!complete)total.unknownCost=true;
 }
 export async function episode(path,seed,opponentId,options,model,budget) {
  if(!['jev_choice','jev_score'].includes(path))throw Error('M0 supports only explicit model decision paths');
