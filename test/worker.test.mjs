@@ -150,3 +150,19 @@ test('stopping during research completion retains stopped worker state',async()=
  assert.equal(f.worker.status().state,'stopped');assert.equal(await f.worker.tick(),null);
  await f.runtime.close();f.store.close();
 });
+
+
+test('first-settlement trigger ignores old corrections, retains them in next research snapshot and persists mode',async()=>{
+ const f=fixtureWorker({feedbackTriggerMode:'first_settlement'});
+ f.feedback('one');assert.equal((await f.worker.tick()).run.status,'no_change');assert.equal(f.calls(),1);
+ const first=f.store.latestFeedback('scope')[0].feedback;
+ f.store.recordFeedback({...first,revision:2,metrics:{reward:-5}});
+ assert.equal(await f.worker.tick(),null);assert.equal(f.calls(),1);
+ f.feedback('two');const result=await f.worker.tick();assert.equal(result.run.status,'no_change');assert.equal(f.calls(),2);
+ const snapshot=f.store.getArtifact(result.run.researchSnapshotId,{allowPrivate:true});
+ assert.equal(snapshot.feedback.find(item=>item.feedbackId==='one').metrics.reward,-5);
+ assert.equal(f.store.latestEvent('scope','research.triggered').data.feedbackTriggerMode,'first_settlement');
+ const restored=new ResearchWorker({store:f.store,orchestrator:f.orchestrator,scopeId:'scope',protocol:f.final,developmentProtocol:f.development,settledTrajectories:1,cooldownMs:0,feedbackTriggerMode:'first_settlement'});
+ f.store.recordFeedback({...first,revision:3,metrics:{reward:-6}});assert.equal(await restored.tick(),null);assert.equal(f.calls(),2);
+ await f.runtime.close();f.store.close();
+});

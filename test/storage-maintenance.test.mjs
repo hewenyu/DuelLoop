@@ -26,10 +26,10 @@ test('restore rejects empty, non-SQLite, foreign and unknown-schema backups with
   rejectsUnchanged(empty, join(dir, 'empty-restored.sqlite'), 'STORAGE_FAILURE');
   const text = join(dir, 'text.sqlite'); writeFileSync(text, 'not a SQLite file'.repeat(20));
   rejectsUnchanged(text, join(dir, 'text-restored.sqlite'), 'STORAGE_FAILURE');
-  for (const version of [0, 1, 2, 3]) {
+  for (const version of [0, 1, 2, 3, 4]) {
     const source = join(dir, `foreign-${version}.sqlite`); const db = new DatabaseSync(source);
     db.exec(`CREATE TABLE unrelated (id INTEGER); PRAGMA user_version=${version};`); db.close();
-    rejectsUnchanged(source, join(dir, `foreign-${version}-restored.sqlite`), [1, 2].includes(version) ? 'STORAGE_FAILURE' : 'VERSION_INCOMPATIBLE');
+    rejectsUnchanged(source, join(dir, `foreign-${version}-restored.sqlite`), [1, 2, 3].includes(version) ? 'STORAGE_FAILURE' : 'VERSION_INCOMPATIBLE');
   }
 });
 test('restore validates required schema and artifact digests without repairing malformed sources', async t => {

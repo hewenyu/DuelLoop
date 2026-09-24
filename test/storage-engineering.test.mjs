@@ -28,7 +28,7 @@ function insertIntent(db, value) {
 
 function downgradeToSchemaOne(db) {
   for (const row of db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL").all()) db.exec(`DROP INDEX "${row.name}"`);
-  for (const table of ['feedback_latest', 'holdout_resources', 'holdout_caps', 'holdout_seeds']) db.exec(`DROP TABLE ${table}`);
+  for (const table of ['feedback_latest', 'holdout_resources', 'holdout_caps', 'holdout_seeds', 'receipt_events', 'first_settlements']) db.exec(`DROP TABLE ${table}`);
   for (const column of ['activated', 'invalid_reason', 'expected_active', 'validation_digest', 'last_deferral_id']) db.exec(`ALTER TABLE releases DROP COLUMN ${column}`);
   db.exec('ALTER TABLE intents DROP COLUMN status; PRAGMA user_version=1;');
 }
@@ -134,7 +134,7 @@ test('schema 1 migrates in place, preserving journal, executions, revisions, rel
   assert.deepEqual(store.holdoutAvailability('historical', 1), { used: 1, remaining: 0 });
   assert.throws(() => store.registerHoldout({ ...protocol, holdoutId: 'renamed' }), { code: 'HOLDOUT_UNAVAILABLE' });
   assert.equal(store.integrity().ok, true);
-  const check = new DatabaseSync(path, { readOnly: true }); assert.equal(check.prepare('PRAGMA user_version').get().user_version, 2); check.close();
+  const check = new DatabaseSync(path, { readOnly: true }); assert.equal(check.prepare('PRAGMA user_version').get().user_version, 3); check.close();
 });
 
 
@@ -219,4 +219,72 @@ test('current rolling evidence follows committed feedback cursors despite old ho
   const complete = store.getArtifact(store.snapshot('scope', Date.now(), { maxDecisions: 3, maxFeedback: 1001 }));
   assert.equal(complete.window.feedbackTruncated, false);
   assert.equal(complete.window.decisionsTruncated, false);
+});
+
+
+test('recent research status reads apply scope, ordering and limit before decoding historical JSON',t=>{
+ const path=location(t),store=new SqliteStore(path);t.after(()=>store.close());
+ const db=new DatabaseSync(path);t.after(()=>db.close());
+ const insert=db.prepare('INSERT INTO runs VALUES(?,?,?,?,?)');
+ insert.run('corrupt-old','scope','no_change',0,'not JSON');
+ for(let index=0;index<25;index++)insert.run(`recent-${index}`,'scope','no_change',0,JSON.stringify({id:`recent-${index}`}));
+ insert.run('other','other-scope','no_change',0,'not JSON');
+ assert.deepEqual(store.listRuns('scope',{limit:3,descending:true}).map(run=>run.id),['recent-24','recent-23','recent-22']);
+ assert.throws(()=>store.listRuns('scope',{limit:0}),{code:'CONFIG_INVALID'});
+ const plan=db.prepare('EXPLAIN QUERY PLAN SELECT data FROM runs WHERE scope_id=? ORDER BY rowid DESC LIMIT ?').all('scope',3);
+ assert(plan.some(row=>row.detail.includes('runs_scope_created')),JSON.stringify(plan));
+ assert(!plan.some(row=>row.detail.includes('TEMP B-TREE')),JSON.stringify(plan));
+});
+
+test('scope summary remains a read during another connection write transaction and skips release diagnostics', t => {
+  const path = location(t), store = new SqliteStore(path); t.after(() => store.close());
+  const base = bootstrap(store);
+  const db = new DatabaseSync(path); t.after(() => db.close());
+  db.prepare('UPDATE releases SET data=? WHERE digest=?').run('malformed historical release', base);
+  t.mock.method(store, 'assertReleaseEligible', () => { assert.fail('summary must not check eligibility'); });
+  t.mock.method(store, 'release', () => { assert.fail('summary must not load release artifacts'); });
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    assert.deepEqual(store.scopeSummary('scope'), {
+      scopeId: 'scope', activeReleaseDigest: base,
+      activationMode: 'automatic_after_validation', activationPaused: false,
+    });
+    assert.deepEqual(store.scopeSummary('missing'), {
+      scopeId: 'missing', activeReleaseDigest: null,
+      activationMode: 'automatic_after_validation', activationPaused: false,
+    });
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM scopes WHERE id=?').get('missing').n, 0);
+  } finally { db.exec('ROLLBACK'); }
+});
+
+test('scope summary reads committed activation, pause and mode changes without caching', t => {
+  const path = location(t), reader = new SqliteStore(path), writer = new SqliteStore(path);
+  t.after(() => { writer.close(); reader.close(); });
+  assert.equal(reader.scopeSummary('scope').activeReleaseDigest, null);
+  const first = bootstrap(writer);
+  assert.equal(reader.scopeSummary('scope').activeReleaseDigest, first);
+  writer.pauseActivation('scope', true);
+  writer.setActivationMode('scope', 'explicit');
+  assert.deepEqual(reader.scopeSummary('scope'), {
+    scopeId: 'scope', activeReleaseDigest: first, activationMode: 'explicit', activationPaused: true,
+  });
+  writer.pauseActivation('scope', false);
+  const strategyDigest = writer.putArtifact('strategy', { version: '2' });
+  writer.createRun({ id: 'next', scopeId: 'scope', baseReleaseDigest: first, researchSnapshotId: 'snapshot', evaluationProtocolDigest: 'protocol', status: 'created', data: {} });
+  writer.transitionRun('next', ['created'], 'researching');
+  writer.transitionRun('next', ['researching'], 'candidate_locked');
+  writer.transitionRun('next', ['candidate_locked'], 'final_evaluating');
+  writer.transitionRun('next', ['final_evaluating'], 'completed_passed');
+  const validationDigest = writer.putArtifact('validation_report', {
+    candidateDigest: strategyDigest, baseReleaseDigest: first, dependencies: {}, status: 'passed', stage: 'final',
+  }, 'private');
+  const second = writer.registerRelease({
+    strategyDigest, dependencies: {}, scopeId: 'scope', expectedActiveDigest: first,
+    validationDigest, source: 'research', researchRunId: 'next',
+  });
+  writer.activate(second, {}, { explicit: true });
+  writer.setActivationMode('scope', 'candidate_only');
+  assert.deepEqual(reader.scopeSummary('scope'), {
+    scopeId: 'scope', activeReleaseDigest: second, activationMode: 'candidate_only', activationPaused: false,
+  });
 });

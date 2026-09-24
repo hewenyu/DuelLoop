@@ -65,11 +65,11 @@ restored.close();
 
 恢复检查只读打开源文件，验证 SQLite 格式、版本、必要表以及产物引用；空文件、其他应用的 SQLite 库、缺表或带未合并 WAL 的运行库都会拒绝。失败不把源文件初始化成空的 DuelLoop 数据库，也不修改其内容或权限。
 
-当前持久 Schema 版本为 2。空库初始化为 2；Schema 1 在写锁内原子迁移，保留历史证据、发布、执行和保留集额度。迁移再次检查版本，两个进程同时打开旧库不会重复修改表。未知较新版本拒绝，也不支持任意降级。升级前保留可读备份，运行安装包检查和本领域回归；依赖改变后重新核对发布绑定。
+当前持久 Schema 版本为 3。空库初始化为 3；Schema 1/2 在写锁内原子迁移，保留历史证据、发布、执行和保留集额度。迁移再次检查版本，两个进程同时打开旧库不会重复修改表。未知较新版本拒绝，也不支持任意降级。升级前保留可读备份，运行安装包检查和本领域回归；依赖改变后重新核对发布绑定。
 
 ## 行为版本升级
 
-当前策略 `schemaVersion` 为 `2.0`，评价协议 `version` 为 `3.0`，运行时为 `duelloop-runtime-4`，应用配置 Schema 为 1，SQLite Schema 为 2。协议性能字段改为 `maxP95DecisionComputeMs`，不代表完整 SDK 的 P95。旧策略的 `decision.minRequiredConfidence`、`exitConditions`、`fallback`，旧领域的 `baselineVersion`、`fallback()`，以及评价协议 `maxFallbackRate` 已删除；公开输入中的旧字段不能静默接受。
+当前策略 `schemaVersion` 为 `2.0`，评价协议 `version` 为 `3.0`，运行时为 `duelloop-runtime-5`，应用配置 Schema 为 1，SQLite Schema 为 3。协议性能字段改为 `maxP95DecisionComputeMs`，不代表完整 SDK 的 P95。旧策略的 `decision.minRequiredConfidence`、`exitConditions`、`fallback`，旧领域的 `baselineVersion`、`fallback()`，以及评价协议 `maxFallbackRate` 已删除；公开输入中的旧字段不能静默接受。
 
 升级前保留数据库备份与旧实验。历史 JSON 和反馈不做覆盖迁移；旧发布、轨迹绑定及验证报告也不获得新运行资格。使用新策略、新协议及当前行为依赖重新验证和登记发布；需要新的应用/作用域承接时由宿主显式选择，并正确接回环境和处理在途轨迹。不能删除数据库、清零保留集额度或把旧报告改写为新版来完成迁移。最终保留集已使用的实验，需要独立的新评价设计和新数据。
 
@@ -77,7 +77,7 @@ restored.close();
 
 `ResearchWorker` 从已结算反馈和持久触发记录判断样本门槛与冷却时间。同一作用域已有未完成研究时不再创建另一轮。构造参数包括 `orchestrator`、`store`、`scopeId`、最终和开发协议、`settledTrajectories`、`cooldownMs`，以及可选 `onRelease` 回调。
 
-触发器使用最新反馈修订投影和持久 journal 游标。首次研究模型调用的预算扣次与触发游标在同一事务提交；相同宿主时间戳、乱序接收时间和新修订都能识别，重复修订不再次触发。空闲轮询只读取索引和汇总，不创建快照或加载全部历史。
+默认触发器使用最新反馈修订投影和持久 journal 游标。可显式配置 `feedbackTriggerMode: 'first_settlement'`，只按每条轨迹的首次结算触发，修订仍进入研究快照；默认 `latest_revision` 兼容旧行为。首次结算 ledger 在 Schema 3 迁移时从历史事件补齐，并使用索引查询。首次研究模型调用的预算扣次与触发游标在同一事务提交；相同宿主时间戳、乱序接收时间和新修订都能识别，重复修订不再次触发。空闲轮询只读取索引和汇总，不创建快照或加载全部历史。
 
 研究快照默认保留最新 1000 条决策及 1000 条反馈，可通过 `snapshotOptions: { maxDecisions, maxFeedback }` 调整，每项范围 1—10000。这是滚动窗口：已观察但落在窗口外的旧记录不会逐批重新触发研究；相邻研究的证据窗口允许重叠。触发游标控制新增经验是否足以开新研究，快照在自己的读取事务中固定具体修订。容量限制按字节另行设置，记录数上限不保证产物小于某个字节限额。
 
@@ -102,6 +102,8 @@ await Promise.allSettled([fast, slow]);
 激活策略由 `store.setActivationMode(scopeId, mode)` 控制，支持 `candidate_only`、`automatic_after_validation`、`explicit`；`store.pauseActivation(scopeId, true)` 暂停切换。通过验证的研究只登记候选发布；托管 `step()` 在边界独立调用 `activatePending(scopeId)`，嵌入应用由自己的边界调度调用它。无需用 `onRelease` 激活；该回调仅作可选通知。正常延期使用 `ACTIVATION_DEFERRED`，候选失效被标记，存储等故障仍向外抛出。边界未到不会结束研究轮询。直接 `activate()` 也区分延期和故障，并再次验证资格与领域边界。回退使用 `await app.rollback(scopeId, targetReleaseDigest)`，同时检查作用域、运行模式、完整验证绑定和领域边界；存储接口属于底层机制，不能代替运行时检查。回退不会改写在途轨迹；曾激活的历史版本不会再被自动调度，若确需重新启用，必须显式调用 `app.activate(digest, true)` 并满足当前基线及验证条件。已激活发布的验证被显式作废后，后续决策会停止，需要恢复兼容且有效的版本或重新验证。数据库通过作用域所属应用绑定拒绝其他应用接管同一作用域。
 
 `store.scopeStatus(scopeId, app.dependencies)` 可读取持久的激活模式、暂停状态、发布状态及阻塞原因。CLI `status` 不载入领域或发起模型调用，因此 `dependenciesChecked: false`，边界标记为 `not_checked`；`lastDeferral` 仅表示最近一次真实激活尝试的延期记录。诊断为 pending 不等于获得提交许可，实际激活仍重新检查依赖与当前边界。
+
+高频网页状态和 worker heartbeat 使用 `store.scopeSummary(scopeId)`：只读取当前 scope 的 active release、激活模式和暂停状态，不开写事务、不遍历历史 release、不执行 eligibility 检查，也不缓存旧值。它只展示状态，不授予激活或执行权限；需要完整发布诊断时继续使用 `scopeStatus`。
 
 研究调用 `protocolAvailability(finalProtocol)` 预检最终资源；额度耗尽时 Worker 的 `status().state` 为 `waiting_protocol`，不调用模型也不消费触发反馈。新建任务会报 `HOLDOUT_UNAVAILABLE`；已创建任务遇到额度被其他研究用尽时进入 `waiting_protocol` 终态。最终阶段仍原子领取额度。协议和配额持久冻结，不能更换 ID 复用同领域种子，也不能增加已注册额度。SDK 用 `worker.updateProtocols({ protocol, developmentProtocol })` 配置独立的新资源；CLI 修改协议文件后重启研究 Worker。已有任务的协议不被替换。CLI `status` 显示带时间戳的最后一条 Worker 资源状态；它不是进程心跳。
 

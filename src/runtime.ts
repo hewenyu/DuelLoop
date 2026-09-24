@@ -3,14 +3,14 @@ import { DuelLoopError, invariant } from './errors.js';
 import { buildQuestions, compileStrategy, evaluateAnswers, validateScoreAnswer } from './strategy.js';
 import { canonicalize, digest, seededRandom, withDeadline } from './utils.js';
 import { normalizeModelUsage } from './usage.js';
-import type { ActionCommand, BehaviorDependencies, CandidateAction, DecisionModel, DecisionRecord, DomainDefinition, DuelLoopStore, ExecutionMode, ExecutionReceipt, FeedbackEvent, JournalEvent, ModelUsage, Observation, StrategyPackage } from './types.js';
+import type { ActionCommand, BehaviorDependencies, CandidateAction, DecisionModel, DecisionOptions, DecisionRecord, DomainDefinition, DuelLoopStore, ExecutionMode, ExecutionReceipt, FeedbackEvent, JournalEvent, ModelUsage, Observation, StrategyPackage, TrajectoryIdentity } from './types.js';
 
 export interface DuelLoopOptions {
   applicationId: string; domain: DomainDefinition; model: DecisionModel; store: DuelLoopStore;
   mode?: ExecutionMode; executionOwner?: 'framework'|'host';
   maxDecisionMs?: number; executionReserveMs?: number; randomSeed?: string;
 }
-export const RUNTIME_VERSION = 'duelloop-runtime-4';
+export const RUNTIME_VERSION = 'duelloop-runtime-5';
 function measuredUsage(value:unknown):ModelUsage {
   return normalizeModelUsage(value&&typeof value==='object'?value as ModelUsage:undefined);
 }
@@ -86,27 +86,46 @@ export class DuelLoop {
     this.store.rollback(scopeId,target,this.dependencies);
     this.emit('runtime.rolled_back',scopeId,{releaseDigest:target});
   }
-  decide(observation:Observation,candidates?:CandidateAction[]):Promise<DecisionRecord> {return this.track(()=>this.decideInternal(observation,candidates));}
-  private async decideInternal(observation:Observation,candidates?:CandidateAction[]):Promise<DecisionRecord> {
+  lookupTrajectoryRelease(identity:TrajectoryIdentity):string|undefined {
+    this.ensureOpen();this.validateTrajectory(identity);
+    return this.store.lookupTrajectoryRelease(identity.strategyScopeId,identity.streamId,identity.actorId,identity.trajectoryId);
+  }
+  private validateTrajectory(identity:TrajectoryIdentity):void {
+    for(const key of ['strategyScopeId','streamId','actorId','trajectoryId'] as const)
+      invariant(typeof identity[key]==='string'&&identity[key].length>0,'CONFIG_INVALID',`Missing trajectory.${key}`);
+  }
+  pinTrajectory(identity:TrajectoryIdentity):string {
+    this.ensureOpen();invariant(!this.stopping,'CANCELLED','Runtime stopped accepting trajectory pins');
+    this.validateTrajectory(identity);
+    this.store.bindScope(identity.strategyScopeId,this.applicationId);
+    const release=this.store.trajectoryRelease(identity.strategyScopeId,identity.streamId,identity.actorId,identity.trajectoryId);
+    this.assertUsableRelease(release);return release;
+  }
+  decide(observation:Observation,candidates?:CandidateAction[],options:DecisionOptions={}):Promise<DecisionRecord> {return this.track(()=>this.decideInternal(observation,candidates,options));}
+  private async decideInternal(observation:Observation,candidates?:CandidateAction[],options:DecisionOptions={}):Promise<DecisionRecord> {
     invariant(!this.failure,'DECISION_STOPPED','Runtime failed; inspect the stopped decision before creating a new instance',this.failure);
     this.ensureOpen();invariant(!this.stopping,'CANCELLED','Runtime stopped accepting decisions');
-    const startedAt=Date.now();const deadline=Math.min(observation.deadline,startedAt+this.maxDecisionMs);
+    const startedAt=Date.now();
+    invariant(options.modelDeadline===undefined||Number.isFinite(options.modelDeadline),'CONFIG_INVALID','Invalid model deadline');
+    const modelDeadline=Math.min(observation.deadline-this.reserve,startedAt+this.maxDecisionMs-this.reserve,options.modelDeadline??Infinity);
+    const signal=options.signal?AbortSignal.any([this.lifecycle.signal,options.signal]):this.lifecycle.signal;
+    invariant(!signal.aborted,'CANCELLED','Decision cancelled before preparation');
     this.validateObservation(observation);
     this.store.bindScope(observation.strategyScopeId,this.applicationId);
-    invariant(deadline>Date.now(),'STATE_STALE','Observation deadline expired');
-    const actions=candidates??await this.deadline(deadline,()=>this.domain.candidates(observation));this.validateCandidates(actions,observation);
+    invariant(observation.deadline>Date.now(),'STATE_STALE','Observation deadline expired');
+    const actions=candidates??await this.decisionDeadline(modelDeadline,()=>this.domain.candidates(observation),signal);this.validateCandidates(actions,observation);
     const releaseDigest=this.store.trajectoryRelease(observation.strategyScopeId,observation.streamId,observation.actorId,observation.trajectoryId);
     const binding=this.store.release(releaseDigest);
     this.assertUsableRelease(releaseDigest);
     const strategy=compileStrategy(this.store.getArtifact<StrategyPackage>(binding.strategyDigest),this.domain).strategy;
-    const record:DecisionRecord={decisionId:randomUUID(),observation:{...structuredClone(observation),deadline},candidates:structuredClone(actions),releaseDigest,strategyDigest:binding.strategyDigest,
+    const record:DecisionRecord={decisionId:randomUUID(),observation:structuredClone(observation),modelDeadline,candidates:structuredClone(actions),releaseDigest,strategyDigest:binding.strategyDigest,
       decisionSource:'stopped',action:null,questions:[],answers:{},utilities:{},probabilities:{},startedAt,finishedAt:startedAt};
     try {
         invariant(actions.length>0,'DECISION_STOPPED','No legal candidate; no action was selected',{reason:'NO_LEGAL_ACTION'});
         const request=buildQuestions(strategy,observation,actions,this.domain);record.questions=request.questions;
         record.modelKind=this.model.kind;record.model=this.model.id;
         const modelStartedAt=Date.now();
-        const response=await this.deadline(deadline-this.reserve,signal=>{
+        const response=await this.decisionDeadline(modelDeadline,signal=>{
           invariant(!this.stopping,'CANCELLED','Runtime stopped before model request');
           const pending=this.model.score({...request,signal});
           const late=(usage:unknown,outcome:'completed'|'failed')=>{
@@ -117,7 +136,7 @@ export class DuelLoop {
           };
           void pending.then(value=>late(value?.usage,'completed'),error=>late(error instanceof DuelLoopError?error.context.usage:undefined,'failed'));
           return pending;
-        }).finally(()=>{record.modelLatencyMs=Date.now()-modelStartedAt;});
+        },signal).finally(()=>{record.modelLatencyMs=Date.now()-modelStartedAt;});
         record.usage=measuredUsage(response?.usage);
         invariant(response&&typeof response.model==='string'&&response.model.length>0,'MODEL_INVALID','Model response identity is missing');
         record.model=response.model;
@@ -129,8 +148,8 @@ export class DuelLoop {
           // Persist only validated JSON fields, including valid answers preceding a malformed one.
           record.answers[question.id]={score:answer.score,confidence:answer.confidence,probabilities:{...answer.probabilities}};
         }
-        invariant(!this.stopping,'CANCELLED','Runtime stopped while the model was answering');
-        invariant(Date.now()<deadline,'MODEL_TIMEOUT','Decision expired before model answers could be used');
+        invariant(!this.stopping&&!signal.aborted,'CANCELLED','Decision cancelled while the model was answering');
+        invariant(Date.now()<modelDeadline,'MODEL_TIMEOUT','Decision expired before model answers could be used');
         this.assertUsableRelease(releaseDigest);
         const seed=this.randomSeed===undefined?undefined:`${this.randomSeed}:${observation.trajectoryId}:${observation.revision}`;
         const result=evaluateAnswers(strategy,observation,actions,record.answers,seed===undefined?undefined:seededRandom(seed));
@@ -142,9 +161,10 @@ export class DuelLoop {
       if(!record.usage&&failure.context.usage)record.usage=measuredUsage(failure.context.usage);
       if(record.model&&!record.usage)record.usage={unknown:true};
       record.finishedAt=Date.now();
-      this.stopping=true;this.failure??={decisionId:record.decisionId,code:record.stopReason};
+      const naturallyCancelled=failure.code==='CANCELLED'&&options.signal?.aborted&&!this.lifecycle.signal.aborted;
+      if(!naturallyCancelled){this.stopping=true;this.failure??={decisionId:record.decisionId,code:record.stopReason};}
       this.store.putArtifact('decision',record);this.emit('decision',observation.strategyScopeId,record);
-      this.emit('runtime.stopped',observation.strategyScopeId,{decisionId:record.decisionId,reason:record.stopReason});
+      this.emit(naturallyCancelled?'decision.cancelled':'runtime.stopped',observation.strategyScopeId,{decisionId:record.decisionId,reason:record.stopReason});
       throw new DuelLoopError(failure.code,failure.message,{...failure.context,decisionId:record.decisionId,stopReason:record.stopReason});
     }
     record.finishedAt=Date.now();this.store.putArtifact('decision',record);this.emit('decision',observation.strategyScopeId,record);return record;
@@ -158,10 +178,10 @@ export class DuelLoop {
       let decisionEndToEndLatencyMs:number|undefined;let executionAckLatencyMs:number|undefined;
       try {
         const observation=await this.deadline(deadline,()=>this.domain.observe(streamId));scopeId=observation.strategyScopeId;
-        observation.deadline=Math.min(observation.deadline,deadline);effectiveDeadline=observation.deadline;
+        effectiveDeadline=observation.deadline;
         const unresolved=this.store.unresolvedIntents(observation.strategyScopeId,streamId);
         invariant(this.executionOwner==='host'||this.mode==='shadow'||unresolved.length===0,'EXECUTION_UNKNOWN','Unresolved prior execution requires reconciliation');
-        decision=await this.decide(observation);decisionEndToEndLatencyMs=Date.now()-started;
+        decision=await this.decide(observation,undefined,{modelDeadline:deadline-this.reserve});decisionEndToEndLatencyMs=Date.now()-started;
         let receipt:ExecutionReceipt|null=null;
         if(this.mode!=='shadow'&&this.executionOwner==='framework'&&decision.action) {
           const executionStarted=Date.now();receipt=await this.executeDecision(decision);executionAckLatencyMs=Date.now()-executionStarted;
@@ -206,6 +226,42 @@ export class DuelLoop {
     this.ensureOpen();invariant(this.executionOwner==='host'&&this.mode!=='shadow','ACCESS_DENIED','Host execution is disabled');
     return this.prepareExecution(decision);
   }
+  resumeHostExecution(decision:DecisionRecord,options:{signal?:AbortSignal}={}):Promise<ActionCommand> {
+    return this.track(()=>this.resumeHostExecutionInternal(decision,options));
+  }
+  private async resumeHostExecutionInternal(decision:DecisionRecord,options:{signal?:AbortSignal}):Promise<ActionCommand> {
+    this.ensureOpen();invariant(this.executionOwner==='host'&&this.mode!=='shadow','ACCESS_DENIED','Host recovery is disabled');
+    invariant(!this.stopping,'CANCELLED','Runtime stopped accepting execution recovery');
+    invariant(decision.decisionSource==='strategy'&&!decision.stopReason&&decision.action&&decision.model&&decision.questions.length>0,'ACCESS_DENIED','Only a successful model decision may resume');
+    const obs=decision.observation;this.validateObservation(obs);this.store.bindScope(obs.strategyScopeId,this.applicationId);
+    const saved=this.store.getArtifact<DecisionRecord>(digest(decision));invariant(saved.decisionId===decision.decisionId,'CONFIG_INVALID','Decision not issued by this store');
+    const existing=this.store.intent(decision.decisionId);
+    invariant(existing,'NOT_FOUND','Host recovery requires an existing intent');
+    invariant(!existing.receipt||!['completed','rejected'].includes(existing.receipt.status),'EXECUTION_UNKNOWN','Terminal execution cannot be resumed');
+    const command=existing.command;
+    invariant(command.decisionId===decision.decisionId&&command.idempotencyKey===decision.decisionId&&command.expectedStateRevision===obs.revision&&
+      command.deadline===obs.deadline&&canonicalize(command.observation)===canonicalize(obs)&&canonicalize(command.action)===canonicalize(decision.action)&&
+      existing.scopeId===obs.strategyScopeId&&existing.streamId===obs.streamId,'CONFLICT','Stored intent differs from immutable decision');
+    this.assertUsableRelease(decision.releaseDigest);
+    const signal=options.signal?AbortSignal.any([this.lifecycle.signal,options.signal]):this.lifecycle.signal;
+    invariant(!signal.aborted,'CANCELLED','Execution recovery cancelled');
+    invariant(Date.now()<command.deadline,'STATE_STALE','Original execution authority expired');
+    const fresh=await this.decisionDeadline(command.deadline,()=>this.domain.observe(obs.streamId),signal);
+    this.validateObservation(fresh);
+    invariant(fresh.strategyScopeId===obs.strategyScopeId&&fresh.streamId===obs.streamId&&fresh.revision===obs.revision&&fresh.trajectoryId===obs.trajectoryId&&fresh.actorId===obs.actorId,'STATE_STALE','Environment changed before execution recovery');
+    invariant(Date.now()<fresh.deadline,'STATE_STALE','Current execution authority expired');
+    const legal=await this.decisionDeadline(command.deadline,()=>this.domain.candidates(fresh),signal);this.validateCandidates(legal,fresh);
+    invariant(legal.some(action=>canonicalize(action)===canonicalize(decision.action)),'STATE_STALE','Recovered action is no longer legal');
+    invariant(!this.stopping&&!signal.aborted,'CANCELLED','Execution recovery cancelled');
+    invariant(Date.now()<command.deadline,'STATE_STALE','Original execution authority expired');
+    this.assertUsableRelease(decision.releaseDigest);
+    const token=this.store.reclaimIntentOwner(decision.decisionId,this.ownerId);
+    this.owners.set(`${obs.strategyScopeId}\0${obs.streamId}`,token);
+    this.store.assertOwner(obs.strategyScopeId,obs.streamId,token);
+    invariant(!this.stopping&&!signal.aborted,'CANCELLED','Execution recovery cancelled');
+    invariant(Date.now()<Math.min(command.deadline,fresh.deadline),'STATE_STALE','Execution authority expired while ownership was reclaimed');
+    return {...command,ownerToken:token};
+  }
   private async prepareExecution(decision:DecisionRecord):Promise<ActionCommand>{
     invariant(!this.stopping,'CANCELLED','Runtime stopped accepting execution');
     invariant(decision.decisionSource==='strategy'&&!decision.stopReason&&decision.model&&decision.questions.length>0,'ACCESS_DENIED','Only a successful model decision may execute');
@@ -235,8 +291,7 @@ export class DuelLoop {
     invariant(this.executionOwner==='host'&&this.mode!=='shadow','ACCESS_DENIED','Host receipt unavailable in this mode');
     invariant(decision.action&&receipt.decisionId===decision.decisionId&&receipt.idempotencyKey===decision.decisionId,'CONFIG_INVALID','Host receipt must refer to decision ID');
     this.store.getArtifact(digest(decision));
-    this.store.recordReceipt(receipt);
-    this.emit('host.execution.receipt',decision.observation.strategyScopeId,receipt);
+    if(this.store.recordReceipt(receipt))this.emit('host.execution.receipt',decision.observation.strategyScopeId,receipt);
   }
   activatePending(scopeId:string):Promise<string|null> {return this.track(()=>this.activatePendingInternal(scopeId));}
   private async activatePendingInternal(scopeId:string):Promise<string|null> {
@@ -301,6 +356,9 @@ export class DuelLoop {
   private track<T>(operation:()=>Promise<T>):Promise<T> {
     const task=Promise.resolve().then(operation);this.pending.add(task);
     void task.then(()=>this.pending.delete(task),()=>this.pending.delete(task));return task;
+  }
+  private decisionDeadline<T>(deadline:number,operation:(signal:AbortSignal)=>Promise<T>,signal:AbortSignal):Promise<T> {
+    return withDeadline(deadline,current=>this.track(()=>operation(current)),signal);
   }
   private deadline<T>(deadline:number,operation:(signal:AbortSignal)=>Promise<T>,cancellable=true):Promise<T> {
     return withDeadline(deadline,signal=>this.track(()=>operation(signal)),cancellable?this.lifecycle.signal:undefined);
