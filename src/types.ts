@@ -231,6 +231,8 @@ export interface DuelLoopStore {
   feedbackProgress(scopeId: string, afterEventId: number, mode?: FeedbackTriggerMode): { eventId: number; receivedAt: number; settledTrajectories: number };
   snapshot(scopeId: string, cutoff: number, options?: { maxDecisions?: number; maxFeedback?: number }): string;
   acquireOwner(scopeId: string, streamId: string, ownerId: string): string;
+  /** Reclaim only this existing unresolved intent after proving no competing live owner. */
+  reclaimIntentOwner(decisionId: string, ownerId: string): string;
   releaseOwner(scopeId: string, streamId: string, ownerToken: string): void;
   assertOwner(scopeId: string, streamId: string, ownerToken: string): void;
   /** Atomically claim a new submission. Reject duplicate or unresolved stream intents. */

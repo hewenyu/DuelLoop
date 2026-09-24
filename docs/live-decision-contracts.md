@@ -69,3 +69,27 @@ Application status polling must not materialize every historical research run.
 sort into SQLite. Defaults preserve ascending creation order and all results.
 A scope-only index supports recent bounded status reads without sorting its entire
 history; this is creation order, not an updated-at ordering claim.
+
+## Cold host execution recovery
+
+`resumeHostExecution(decision, { signal? })` resumes only an existing unresolved
+host intent. It rereads the immutable decision, release, current observation and
+legal candidates, preserves the original authority deadline, and then reclaims
+that intent's execution ownership. It never creates another intent, changes the
+idempotency key/action/observation, calls a model, or sends to the environment.
+The host must recheck its own lease, connection generation and authority immediately
+before sending, and may only retry where the environment guarantees same-key
+idempotency. Terminal receipts cannot be resumed.
+
+`store.reclaimIntentOwner(decisionId, ownerId)` atomically changes the existing
+intent's owner token and owner row. It accepts an absent owner after clean close,
+the same live owner, or an owner whose PID is conclusively dead on this hostname.
+It rejects another live owner, a different hostname, and indeterminate PID checks.
+It does not turn ordinary acquireOwner into a way to bypass pending intents.
+All database-sharing processes must honor this protocol. Cross-host migration or
+container-hostname changes after an unclean crash still require explicit operational
+reconciliation; this is not a distributed fencing lease.
+
+Regression gates cover clean-close/reopen, actual killed owner process, live-owner
+conflict, unknown-host refusal, cancellation/stale authority, immutable payload,
+terminal rejection and repeated recovery without another model call or intent.

@@ -4,6 +4,7 @@
 
 - `decide` 支持逐调用 AbortSignal 和绝对 modelDeadline；模型取消不会误停其他 stream，实际模型失败仍停止。权限 deadline 不再被模型预算覆盖。
 - `pinTrajectory` 支持首个决策前持久绑定策略；runtime 5 明确新的时间行为，旧发布需要重新绑定和验证。
+- `resumeHostExecution` 在重验原始权限、当前合法动作与不可变决策后，仅为原未决intent恢复执行owner；存活或跨主机owner不能被窃取，不重复调用模型。
 - 回执支持稳定 eventId 与持久去重，冲突不能覆盖，重复旧事件不能降级终态；自定义 Store 的 recordReceipt 现在返回 boolean。
 - `listRuns(scopeId?, { limit?, descending? })` 在 SQL 层限制状态轮询读取；默认顺序兼容，scope 索引避免全历史排序。
 - ResearchWorker 可选择 first_settlement，仅新结算轨迹触发；修订仍保留在快照，默认继续使用 latest_revision。

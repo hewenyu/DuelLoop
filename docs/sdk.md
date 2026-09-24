@@ -75,6 +75,8 @@ await app.submitFeedback(feedbackEvents);
 
 `observation.deadline` 始终代表环境执行权限截止时间；有效模型截止时间单独保存在 `DecisionRecord.modelDeadline`，不会延长宿主传入的更早截止。每手开始可调用 `pinTrajectory({ strategyScopeId, streamId, actorId, trajectoryId })`，不必等首次行动才固定策略。调用级 signal 的自然取消只终止该次决策，不停止其他 stream；真实模型故障或超时仍停止实例。
 
+`resumeHostExecution(decision, { signal? })` 在重新核对当前领域观察、合法动作及原始截止时间后，恢复原有未决 intent 的 owner，不重新调用模型。宿主必须再次核对自己的租约和连接，并仅在环境保证同 key 幂等时重发；活 owner、跨 hostname 未知 owner、终态和过期动作均拒绝。
+
 稳定回执提供 `eventId`，重复投递相同事件不会增加执行 journal；同 ID 不同内容拒绝。`SqliteStore.recordReceipt()` 返回是否更新状态，自定义 Store 实现也需要返回 boolean。`accepted` 仍是未解决状态，宿主必须依据环境实际完成证据提交 `completed`。完整恢复契约见 [实时集成](live-decision-contracts.md)。
 
 ## 模型与策略

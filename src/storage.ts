@@ -510,6 +510,31 @@ export class SqliteStore implements DuelLoopStore {
       const token=randomUUID();this.db.prepare('INSERT INTO owners VALUES(?,?,?,?,?,?)').run(scopeId,streamId,ownerId,token,process.pid,hostname());return token;
     });
   }
+  reclaimIntentOwner(decisionId:string,ownerId:string):string {
+    invariant(typeof ownerId==='string'&&ownerId.length>0,'CONFIG_INVALID','Recovery owner ID required');
+    return this.transaction(()=>{
+      const intent=this.intent(decisionId);
+      invariant(intent,'NOT_FOUND','Recovery requires an existing intent');
+      invariant(!intent.receipt||!['completed','rejected'].includes(intent.receipt.status),'EXECUTION_UNKNOWN','Terminal execution cannot be resumed');
+      invariant(intent.command.decisionId===decisionId&&intent.command.idempotencyKey===decisionId,'CONFLICT','Execution intent identity is inconsistent');
+      invariant(this.unresolvedIntents(intent.scopeId,intent.streamId).every(other=>other.decisionId===decisionId),'EXECUTION_UNKNOWN','Other unresolved execution prevents recovery');
+      const old=this.db.prepare('SELECT * FROM owners WHERE scope_id=? AND stream_id=?').get(intent.scopeId,intent.streamId) as {owner_id:string;token:string;pid:number;host:string}|undefined;
+      const sameOwner=old?.owner_id===ownerId&&old.pid===process.pid&&old.host===hostname();
+      if(old&&!sameOwner){
+        invariant(old.host===hostname(),'CONFLICT','Cannot prove an owner on another host has stopped');
+        let dead=false;try{process.kill(old.pid,0);}catch(error){dead=(error as NodeJS.ErrnoException).code==='ESRCH';}
+        invariant(dead,'CONFLICT','Stream still has a live or indeterminate execution owner');
+      }
+      if(sameOwner&&intent.ownerToken===old!.token&&intent.command.ownerToken===old!.token)return old!.token;
+      const token=sameOwner?old!.token:randomUUID();
+      this.db.prepare('INSERT INTO owners VALUES(?,?,?,?,?,?) ON CONFLICT(scope_id,stream_id) DO UPDATE SET owner_id=excluded.owner_id,token=excluded.token,pid=excluded.pid,host=excluded.host')
+        .run(intent.scopeId,intent.streamId,ownerId,token,process.pid,hostname());
+      intent.ownerToken=token;intent.command.ownerToken=token;
+      this.db.prepare('UPDATE intents SET data=? WHERE decision_id=?').run(canonicalize(intent),decisionId);
+      this.appendEvent('execution.owner_reclaimed',intent.scopeId,{decisionId,reason:old?(sameOwner?'same_owner':'dead_local_owner'):'owner_released'},'private');
+      return token;
+    });
+  }
   assertOwner(scopeId:string,streamId:string,token:string):void {const row=this.db.prepare('SELECT token FROM owners WHERE scope_id=? AND stream_id=?').get(scopeId,streamId) as any; invariant(row?.token===token,'CONFLICT','Execution ownership lost');}
   releaseOwner(scopeId:string,streamId:string,token:string):void {this.db.prepare('DELETE FROM owners WHERE scope_id=? AND stream_id=? AND token=?').run(scopeId,streamId,token);}
   saveIntent(intent:Intent):void {

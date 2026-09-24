@@ -226,6 +226,42 @@ export class DuelLoop {
     this.ensureOpen();invariant(this.executionOwner==='host'&&this.mode!=='shadow','ACCESS_DENIED','Host execution is disabled');
     return this.prepareExecution(decision);
   }
+  resumeHostExecution(decision:DecisionRecord,options:{signal?:AbortSignal}={}):Promise<ActionCommand> {
+    return this.track(()=>this.resumeHostExecutionInternal(decision,options));
+  }
+  private async resumeHostExecutionInternal(decision:DecisionRecord,options:{signal?:AbortSignal}):Promise<ActionCommand> {
+    this.ensureOpen();invariant(this.executionOwner==='host'&&this.mode!=='shadow','ACCESS_DENIED','Host recovery is disabled');
+    invariant(!this.stopping,'CANCELLED','Runtime stopped accepting execution recovery');
+    invariant(decision.decisionSource==='strategy'&&!decision.stopReason&&decision.action&&decision.model&&decision.questions.length>0,'ACCESS_DENIED','Only a successful model decision may resume');
+    const obs=decision.observation;this.validateObservation(obs);this.store.bindScope(obs.strategyScopeId,this.applicationId);
+    const saved=this.store.getArtifact<DecisionRecord>(digest(decision));invariant(saved.decisionId===decision.decisionId,'CONFIG_INVALID','Decision not issued by this store');
+    const existing=this.store.intent(decision.decisionId);
+    invariant(existing,'NOT_FOUND','Host recovery requires an existing intent');
+    invariant(!existing.receipt||!['completed','rejected'].includes(existing.receipt.status),'EXECUTION_UNKNOWN','Terminal execution cannot be resumed');
+    const command=existing.command;
+    invariant(command.decisionId===decision.decisionId&&command.idempotencyKey===decision.decisionId&&command.expectedStateRevision===obs.revision&&
+      command.deadline===obs.deadline&&canonicalize(command.observation)===canonicalize(obs)&&canonicalize(command.action)===canonicalize(decision.action)&&
+      existing.scopeId===obs.strategyScopeId&&existing.streamId===obs.streamId,'CONFLICT','Stored intent differs from immutable decision');
+    this.assertUsableRelease(decision.releaseDigest);
+    const signal=options.signal?AbortSignal.any([this.lifecycle.signal,options.signal]):this.lifecycle.signal;
+    invariant(!signal.aborted,'CANCELLED','Execution recovery cancelled');
+    invariant(Date.now()<command.deadline,'STATE_STALE','Original execution authority expired');
+    const fresh=await this.decisionDeadline(command.deadline,()=>this.domain.observe(obs.streamId),signal);
+    this.validateObservation(fresh);
+    invariant(fresh.strategyScopeId===obs.strategyScopeId&&fresh.streamId===obs.streamId&&fresh.revision===obs.revision&&fresh.trajectoryId===obs.trajectoryId&&fresh.actorId===obs.actorId,'STATE_STALE','Environment changed before execution recovery');
+    invariant(Date.now()<fresh.deadline,'STATE_STALE','Current execution authority expired');
+    const legal=await this.decisionDeadline(command.deadline,()=>this.domain.candidates(fresh),signal);this.validateCandidates(legal,fresh);
+    invariant(legal.some(action=>canonicalize(action)===canonicalize(decision.action)),'STATE_STALE','Recovered action is no longer legal');
+    invariant(!this.stopping&&!signal.aborted,'CANCELLED','Execution recovery cancelled');
+    invariant(Date.now()<command.deadline,'STATE_STALE','Original execution authority expired');
+    this.assertUsableRelease(decision.releaseDigest);
+    const token=this.store.reclaimIntentOwner(decision.decisionId,this.ownerId);
+    this.owners.set(`${obs.strategyScopeId}\0${obs.streamId}`,token);
+    this.store.assertOwner(obs.strategyScopeId,obs.streamId,token);
+    invariant(!this.stopping&&!signal.aborted,'CANCELLED','Execution recovery cancelled');
+    invariant(Date.now()<Math.min(command.deadline,fresh.deadline),'STATE_STALE','Execution authority expired while ownership was reclaimed');
+    return {...command,ownerToken:token};
+  }
   private async prepareExecution(decision:DecisionRecord):Promise<ActionCommand>{
     invariant(!this.stopping,'CANCELLED','Runtime stopped accepting execution');
     invariant(decision.decisionSource==='strategy'&&!decision.stopReason&&decision.model&&decision.questions.length>0,'ACCESS_DENIED','Only a successful model decision may execute');
