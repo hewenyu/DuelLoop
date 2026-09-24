@@ -103,6 +103,8 @@ await Promise.allSettled([fast, slow]);
 
 `store.scopeStatus(scopeId, app.dependencies)` 可读取持久的激活模式、暂停状态、发布状态及阻塞原因。CLI `status` 不载入领域或发起模型调用，因此 `dependenciesChecked: false`，边界标记为 `not_checked`；`lastDeferral` 仅表示最近一次真实激活尝试的延期记录。诊断为 pending 不等于获得提交许可，实际激活仍重新检查依赖与当前边界。
 
+高频网页状态和 worker heartbeat 使用 `store.scopeSummary(scopeId)`：只读取当前 scope 的 active release、激活模式和暂停状态，不开写事务、不遍历历史 release、不执行 eligibility 检查，也不缓存旧值。它只展示状态，不授予激活或执行权限；需要完整发布诊断时继续使用 `scopeStatus`。
+
 研究调用 `protocolAvailability(finalProtocol)` 预检最终资源；额度耗尽时 Worker 的 `status().state` 为 `waiting_protocol`，不调用模型也不消费触发反馈。新建任务会报 `HOLDOUT_UNAVAILABLE`；已创建任务遇到额度被其他研究用尽时进入 `waiting_protocol` 终态。最终阶段仍原子领取额度。协议和配额持久冻结，不能更换 ID 复用同领域种子，也不能增加已注册额度。SDK 用 `worker.updateProtocols({ protocol, developmentProtocol })` 配置独立的新资源；CLI 修改协议文件后重启研究 Worker。已有任务的协议不被替换。CLI `status` 显示带时间戳的最后一条 Worker 资源状态；它不是进程心跳。
 
 ## 资源、数据和信任范围

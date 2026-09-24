@@ -235,3 +235,56 @@ test('recent research status reads apply scope, ordering and limit before decodi
  assert(plan.some(row=>row.detail.includes('runs_scope_created')),JSON.stringify(plan));
  assert(!plan.some(row=>row.detail.includes('TEMP B-TREE')),JSON.stringify(plan));
 });
+
+test('scope summary remains a read during another connection write transaction and skips release diagnostics', t => {
+  const path = location(t), store = new SqliteStore(path); t.after(() => store.close());
+  const base = bootstrap(store);
+  const db = new DatabaseSync(path); t.after(() => db.close());
+  db.prepare('UPDATE releases SET data=? WHERE digest=?').run('malformed historical release', base);
+  t.mock.method(store, 'assertReleaseEligible', () => { assert.fail('summary must not check eligibility'); });
+  t.mock.method(store, 'release', () => { assert.fail('summary must not load release artifacts'); });
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    assert.deepEqual(store.scopeSummary('scope'), {
+      scopeId: 'scope', activeReleaseDigest: base,
+      activationMode: 'automatic_after_validation', activationPaused: false,
+    });
+    assert.deepEqual(store.scopeSummary('missing'), {
+      scopeId: 'missing', activeReleaseDigest: null,
+      activationMode: 'automatic_after_validation', activationPaused: false,
+    });
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM scopes WHERE id=?').get('missing').n, 0);
+  } finally { db.exec('ROLLBACK'); }
+});
+
+test('scope summary reads committed activation, pause and mode changes without caching', t => {
+  const path = location(t), reader = new SqliteStore(path), writer = new SqliteStore(path);
+  t.after(() => { writer.close(); reader.close(); });
+  assert.equal(reader.scopeSummary('scope').activeReleaseDigest, null);
+  const first = bootstrap(writer);
+  assert.equal(reader.scopeSummary('scope').activeReleaseDigest, first);
+  writer.pauseActivation('scope', true);
+  writer.setActivationMode('scope', 'explicit');
+  assert.deepEqual(reader.scopeSummary('scope'), {
+    scopeId: 'scope', activeReleaseDigest: first, activationMode: 'explicit', activationPaused: true,
+  });
+  writer.pauseActivation('scope', false);
+  const strategyDigest = writer.putArtifact('strategy', { version: '2' });
+  writer.createRun({ id: 'next', scopeId: 'scope', baseReleaseDigest: first, researchSnapshotId: 'snapshot', evaluationProtocolDigest: 'protocol', status: 'created', data: {} });
+  writer.transitionRun('next', ['created'], 'researching');
+  writer.transitionRun('next', ['researching'], 'candidate_locked');
+  writer.transitionRun('next', ['candidate_locked'], 'final_evaluating');
+  writer.transitionRun('next', ['final_evaluating'], 'completed_passed');
+  const validationDigest = writer.putArtifact('validation_report', {
+    candidateDigest: strategyDigest, baseReleaseDigest: first, dependencies: {}, status: 'passed', stage: 'final',
+  }, 'private');
+  const second = writer.registerRelease({
+    strategyDigest, dependencies: {}, scopeId: 'scope', expectedActiveDigest: first,
+    validationDigest, source: 'research', researchRunId: 'next',
+  });
+  writer.activate(second, {}, { explicit: true });
+  writer.setActivationMode('scope', 'candidate_only');
+  assert.deepEqual(reader.scopeSummary('scope'), {
+    scopeId: 'scope', activeReleaseDigest: second, activationMode: 'candidate_only', activationPaused: false,
+  });
+});

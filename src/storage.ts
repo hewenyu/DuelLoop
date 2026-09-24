@@ -222,6 +222,10 @@ export class SqliteStore implements DuelLoopStore {
     const value=JSON.parse(row.data) as ReleaseBinding; invariant(digest(value)===hash,'STORAGE_FAILURE','Release digest mismatch'); return value;
   }
   activeRelease(scopeId:string):string|null { return (this.db.prepare('SELECT active FROM scopes WHERE id=?').get(scopeId) as any)?.active??null; }
+  scopeSummary(scopeId:string):Pick<ScopeStatus,'scopeId'|'activeReleaseDigest'|'activationMode'|'activationPaused'> {
+    const row=this.db.prepare('SELECT active,mode,paused FROM scopes WHERE id=?').get(scopeId) as {active:string|null;mode:ScopeStatus['activationMode'];paused:number}|undefined;
+    return {scopeId,activeReleaseDigest:row?.active??null,activationMode:row?.mode??'automatic_after_validation',activationPaused:!!row?.paused};
+  }
   scopeStatus(scopeId:string,dependencies?:BehaviorDependencies):ScopeStatus {
     return this.transaction(()=>{
       const scope=this.db.prepare('SELECT * FROM scopes WHERE id=?').get(scopeId) as any;

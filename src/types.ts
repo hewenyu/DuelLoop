@@ -202,6 +202,7 @@ export interface DuelLoopStore {
   latestEvent(scopeId: string, type: string, options?: { allowPrivate?: boolean }): JournalEvent | undefined;
   registerRelease(binding: ReleaseBinding): string;
   activeRelease(scopeId: string): string | null;
+  scopeSummary(scopeId: string): Pick<ScopeStatus, 'scopeId' | 'activeReleaseDigest' | 'activationMode' | 'activationPaused'>;
   scopeStatus(scopeId: string, dependencies?: BehaviorDependencies): ScopeStatus;
   release(digest: string): ReleaseBinding;
   assertReleaseEligible(digest: string, dependencies: BehaviorDependencies): void;

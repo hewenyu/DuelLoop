@@ -7,6 +7,7 @@
 - `resumeHostExecution` 在重验原始权限、当前合法动作与不可变决策后，仅为原未决intent恢复执行owner；存活或跨主机owner不能被窃取，不重复调用模型。
 - 回执支持稳定 eventId 与持久去重，冲突不能覆盖，重复旧事件不能降级终态；自定义 Store 的 recordReceipt 现在返回 boolean。
 - `listRuns(scopeId?, { limit?, descending? })` 在 SQL 层限制状态轮询读取；默认顺序兼容，scope 索引避免全历史排序。
+- `scopeSummary(scopeId)` 为高频状态轮询提供单次主键 SELECT，不开写事务、不加载历史发布或检查 eligibility；完整 `scopeStatus` 诊断语义不变。
 - ResearchWorker 可选择 first_settlement，仅新结算轨迹触发；修订仍保留在快照，默认继续使用 latest_revision。
 - SQLite Schema 3 原子迁移，保留历史证据并补齐首次结算 ledger；共享同库进程必须一起升级。没有新增金额准入或真实模型调用。
 

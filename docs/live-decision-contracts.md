@@ -70,6 +70,16 @@ sort into SQLite. Defaults preserve ascending creation order and all results.
 A scope-only index supports recent bounded status reads without sorting its entire
 history; this is creation order, not an updated-at ordering claim.
 
+Frequent public status and heartbeat reads use `store.scopeSummary(scopeId)`.
+It returns only `scopeId`, `activeReleaseDigest`, `activationMode` and
+`activationPaused` from a single primary-key `scopes` SELECT, without a write
+transaction, release enumeration, artifact loading or eligibility validation.
+Each call reads current persisted values; there is no stale summary cache.
+Unknown scopes use the same defaults as `scopeStatus` and are not created.
+The full `scopeStatus(scopeId, dependencies?)` remains an explicit diagnostic
+operation with its existing release validation semantics. A summary does not
+confer activation or execution permission; those paths still validate releases.
+
 ## Cold host execution recovery
 
 `resumeHostExecution(decision, { signal? })` resumes only an existing unresolved
