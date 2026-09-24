@@ -28,7 +28,7 @@ function insertIntent(db, value) {
 
 function downgradeToSchemaOne(db) {
   for (const row of db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL").all()) db.exec(`DROP INDEX "${row.name}"`);
-  for (const table of ['feedback_latest', 'holdout_resources', 'holdout_caps', 'holdout_seeds']) db.exec(`DROP TABLE ${table}`);
+  for (const table of ['feedback_latest', 'holdout_resources', 'holdout_caps', 'holdout_seeds', 'receipt_events', 'first_settlements']) db.exec(`DROP TABLE ${table}`);
   for (const column of ['activated', 'invalid_reason', 'expected_active', 'validation_digest', 'last_deferral_id']) db.exec(`ALTER TABLE releases DROP COLUMN ${column}`);
   db.exec('ALTER TABLE intents DROP COLUMN status; PRAGMA user_version=1;');
 }
@@ -134,7 +134,7 @@ test('schema 1 migrates in place, preserving journal, executions, revisions, rel
   assert.deepEqual(store.holdoutAvailability('historical', 1), { used: 1, remaining: 0 });
   assert.throws(() => store.registerHoldout({ ...protocol, holdoutId: 'renamed' }), { code: 'HOLDOUT_UNAVAILABLE' });
   assert.equal(store.integrity().ok, true);
-  const check = new DatabaseSync(path, { readOnly: true }); assert.equal(check.prepare('PRAGMA user_version').get().user_version, 2); check.close();
+  const check = new DatabaseSync(path, { readOnly: true }); assert.equal(check.prepare('PRAGMA user_version').get().user_version, 3); check.close();
 });
 
 

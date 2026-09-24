@@ -65,11 +65,11 @@ restored.close();
 
 恢复检查只读打开源文件，验证 SQLite 格式、版本、必要表以及产物引用；空文件、其他应用的 SQLite 库、缺表或带未合并 WAL 的运行库都会拒绝。失败不把源文件初始化成空的 DuelLoop 数据库，也不修改其内容或权限。
 
-当前持久 Schema 版本为 2。空库初始化为 2；Schema 1 在写锁内原子迁移，保留历史证据、发布、执行和保留集额度。迁移再次检查版本，两个进程同时打开旧库不会重复修改表。未知较新版本拒绝，也不支持任意降级。升级前保留可读备份，运行安装包检查和本领域回归；依赖改变后重新核对发布绑定。
+当前持久 Schema 版本为 3。空库初始化为 3；Schema 1/2 在写锁内原子迁移，保留历史证据、发布、执行和保留集额度。迁移再次检查版本，两个进程同时打开旧库不会重复修改表。未知较新版本拒绝，也不支持任意降级。升级前保留可读备份，运行安装包检查和本领域回归；依赖改变后重新核对发布绑定。
 
 ## 行为版本升级
 
-当前策略 `schemaVersion` 为 `2.0`，评价协议 `version` 为 `3.0`，运行时为 `duelloop-runtime-4`，应用配置 Schema 为 1，SQLite Schema 为 2。协议性能字段改为 `maxP95DecisionComputeMs`，不代表完整 SDK 的 P95。旧策略的 `decision.minRequiredConfidence`、`exitConditions`、`fallback`，旧领域的 `baselineVersion`、`fallback()`，以及评价协议 `maxFallbackRate` 已删除；公开输入中的旧字段不能静默接受。
+当前策略 `schemaVersion` 为 `2.0`，评价协议 `version` 为 `3.0`，运行时为 `duelloop-runtime-5`，应用配置 Schema 为 1，SQLite Schema 为 3。协议性能字段改为 `maxP95DecisionComputeMs`，不代表完整 SDK 的 P95。旧策略的 `decision.minRequiredConfidence`、`exitConditions`、`fallback`，旧领域的 `baselineVersion`、`fallback()`，以及评价协议 `maxFallbackRate` 已删除；公开输入中的旧字段不能静默接受。
 
 升级前保留数据库备份与旧实验。历史 JSON 和反馈不做覆盖迁移；旧发布、轨迹绑定及验证报告也不获得新运行资格。使用新策略、新协议及当前行为依赖重新验证和登记发布；需要新的应用/作用域承接时由宿主显式选择，并正确接回环境和处理在途轨迹。不能删除数据库、清零保留集额度或把旧报告改写为新版来完成迁移。最终保留集已使用的实验，需要独立的新评价设计和新数据。
 
@@ -77,7 +77,7 @@ restored.close();
 
 `ResearchWorker` 从已结算反馈和持久触发记录判断样本门槛与冷却时间。同一作用域已有未完成研究时不再创建另一轮。构造参数包括 `orchestrator`、`store`、`scopeId`、最终和开发协议、`settledTrajectories`、`cooldownMs`，以及可选 `onRelease` 回调。
 
-触发器使用最新反馈修订投影和持久 journal 游标。首次研究模型调用的预算扣次与触发游标在同一事务提交；相同宿主时间戳、乱序接收时间和新修订都能识别，重复修订不再次触发。空闲轮询只读取索引和汇总，不创建快照或加载全部历史。
+默认触发器使用最新反馈修订投影和持久 journal 游标。可显式配置 `feedbackTriggerMode: 'first_settlement'`，只按每条轨迹的首次结算触发，修订仍进入研究快照；默认 `latest_revision` 兼容旧行为。首次结算 ledger 在 Schema 3 迁移时从历史事件补齐，并使用索引查询。首次研究模型调用的预算扣次与触发游标在同一事务提交；相同宿主时间戳、乱序接收时间和新修订都能识别，重复修订不再次触发。空闲轮询只读取索引和汇总，不创建快照或加载全部历史。
 
 研究快照默认保留最新 1000 条决策及 1000 条反馈，可通过 `snapshotOptions: { maxDecisions, maxFeedback }` 调整，每项范围 1—10000。这是滚动窗口：已观察但落在窗口外的旧记录不会逐批重新触发研究；相邻研究的证据窗口允许重叠。触发游标控制新增经验是否足以开新研究，快照在自己的读取事务中固定具体修订。容量限制按字节另行设置，记录数上限不保证产物小于某个字节限额。
 

@@ -5,7 +5,7 @@ import { hostname } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { invariant, DuelLoopError } from './errors.js';
 import { canonicalize, digest, jsonValue } from './utils.js';
-import type { Artifact, BehaviorDependencies, CandidateSubmission, DecisionRecord, DuelLoopStore, EvaluationProtocol, ExecutionMode, ExecutionReceipt, FeedbackEvent, Intent, JournalEvent, Json, ReleaseBinding, ResearchRun, RunStatus, ScopeStatus, ValidationReport } from './types.js';
+import type { Artifact, BehaviorDependencies, CandidateSubmission, DecisionRecord, DuelLoopStore, EvaluationProtocol, ExecutionMode, ExecutionReceipt, FeedbackEvent, FeedbackTriggerMode, Intent, JournalEvent, Json, ReleaseBinding, ResearchRun, RunStatus, ScopeStatus, ValidationReport } from './types.js';
 
 const TERMINAL = new Set<RunStatus>(['cancelled','no_change','budget_exhausted','completed_passed','completed_failed','completed_inconclusive','error','waiting_protocol']);
 const ACTIVE_RUN_SQL="status IN ('created','researching','development_evaluating','candidate_locked','final_evaluating','validated_pending_release','cancel_requested')";
@@ -40,7 +40,7 @@ export class SqliteStore implements DuelLoopStore {
     try {
     this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
     const version = Number((this.db.prepare('PRAGMA user_version').get() as any).user_version);
-    invariant(version <= 2, 'VERSION_INCOMPATIBLE', 'Database is newer than this runtime', {version});
+    invariant(version <= 3, 'VERSION_INCOMPATIBLE', 'Database is newer than this runtime', {version});
     if(this.maxDatabaseBytes!==undefined){
       const pageSize=Number((this.db.prepare('PRAGMA page_size').get() as {page_size:number}).page_size);
       const pageCount=Number((this.db.prepare('PRAGMA page_count').get() as {page_count:number}).page_count);
@@ -67,12 +67,13 @@ export class SqliteStore implements DuelLoopStore {
     }catch(error){try{this.db.exec('ROLLBACK');}catch{}this.db.close();throw this.storageError(error);}
   }
   private migrate(version:number):void {
-    if(version===2)return;
+    if(version===3)return;
     this.transaction(()=>{
       // Another process may have completed migration while this connection waited for the write lock.
       const lockedVersion=Number((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version);
-      invariant(lockedVersion<=2,'VERSION_INCOMPATIBLE','Database is newer than this runtime',{version:lockedVersion});
-      if(lockedVersion===2)return;
+      invariant(lockedVersion<=3,'VERSION_INCOMPATIBLE','Database is newer than this runtime',{version:lockedVersion});
+      if(lockedVersion===3)return;
+      if(lockedVersion<2){
       this.db.exec(`
         ALTER TABLE intents ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
         UPDATE intents SET status=COALESCE(json_extract(data,'$.receipt.status'),'pending');
@@ -115,6 +116,17 @@ export class SqliteStore implements DuelLoopStore {
         this.db.prepare('INSERT INTO holdout_caps VALUES(?,?) ON CONFLICT(id) DO UPDATE SET cap=MIN(cap,excluded.cap)').run(protocol.holdoutId,protocol.maxHoldoutUses);
         for(const seed of protocol.seeds)this.db.prepare('INSERT OR IGNORE INTO holdout_seeds VALUES(?,?,?)').run(protocol.domainId,seed,protocol.holdoutId);
       }
+      }
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS receipt_events (decision_id TEXT NOT NULL,event_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(decision_id,event_id));
+        CREATE TABLE IF NOT EXISTS first_settlements (scope_id TEXT NOT NULL,trajectory_id TEXT NOT NULL,event_id INTEGER NOT NULL,received_at INTEGER NOT NULL,PRIMARY KEY(scope_id,trajectory_id));
+        CREATE INDEX IF NOT EXISTS first_settlements_cursor ON first_settlements(scope_id,event_id);
+        INSERT OR IGNORE INTO first_settlements
+          SELECT scope_id,trajectory_id,id,received_at FROM (SELECT scope_id,json_extract(data,'$.trajectoryId') AS trajectory_id,id,
+            json_extract(data,'$.receivedAt') AS received_at,ROW_NUMBER() OVER (PARTITION BY scope_id,json_extract(data,'$.trajectoryId') ORDER BY id) AS position
+            FROM events WHERE type='feedback.received' AND json_extract(data,'$.settled')=1) WHERE position=1;
+        PRAGMA user_version=3;
+      `);
     });
   }
   private storageError(error:unknown):unknown {
@@ -315,10 +327,14 @@ export class SqliteStore implements DuelLoopStore {
       else for(const [scopeId,releaseDigests] of affected)this.appendEvent('validation.invalidated',scopeId,{validationDigest:hash,reason,releaseDigests});
     });
   }
+  lookupTrajectoryRelease(scopeId:string,streamId:string,actorId:string,trajectoryId:string):string|undefined {
+    const row=this.db.prepare('SELECT release_digest FROM trajectories WHERE scope_id=? AND stream_id=? AND actor_id=? AND trajectory_id=?').get(scopeId,streamId,actorId,trajectoryId) as {release_digest:string}|undefined;
+    return row?.release_digest;
+  }
   trajectoryRelease(scopeId:string,streamId:string,actorId:string,trajectoryId:string):string {
     return this.transaction(()=>{
-      const row=this.db.prepare('SELECT release_digest FROM trajectories WHERE scope_id=? AND stream_id=? AND actor_id=? AND trajectory_id=?').get(scopeId,streamId,actorId,trajectoryId) as any;
-      if(row) return row.release_digest;
+      const existing=this.lookupTrajectoryRelease(scopeId,streamId,actorId,trajectoryId);
+      if(existing)return existing;
       const active=this.activeRelease(scopeId); invariant(active,'NOT_FOUND','Scope has no initial release',{scopeId});
       this.db.prepare('INSERT INTO trajectories VALUES(?,?,?,?,?)').run(scopeId,streamId,actorId,trajectoryId,active); return active;
     });
@@ -435,11 +451,17 @@ export class SqliteStore implements DuelLoopStore {
     if(previous) { invariant(previous.data===canonicalize(f),'CONFLICT','Conflicting feedback revision');return; }
     this.db.prepare('INSERT INTO feedback VALUES(?,?,?,?,?)').run(f.strategyScopeId,f.feedbackId,f.revision,f.receivedAt,canonicalize(f));
     const event=this.appendEvent('feedback.received',f.strategyScopeId,f);
+    if(f.settled)this.db.prepare('INSERT OR IGNORE INTO first_settlements VALUES(?,?,?,?)').run(f.strategyScopeId,f.trajectoryId,event.id,f.receivedAt);
     this.db.prepare('INSERT INTO feedback_latest VALUES(?,?,?,?,?,?) ON CONFLICT(scope_id,feedback_id) DO UPDATE SET revision=excluded.revision,received_at=excluded.received_at,event_id=excluded.event_id,data=excluded.data WHERE excluded.revision>feedback_latest.revision').run(f.strategyScopeId,f.feedbackId,f.revision,f.receivedAt,event.id,canonicalize(f));
     });
   }
-  feedbackProgress(scopeId:string,afterEventId:number):{eventId:number;receivedAt:number;settledTrajectories:number} {
+  feedbackProgress(scopeId:string,afterEventId:number,mode:FeedbackTriggerMode='latest_revision'):{eventId:number;receivedAt:number;settledTrajectories:number} {
     invariant(Number.isSafeInteger(afterEventId)&&afterEventId>=0,'CONFIG_INVALID','Feedback cursor must be a nonnegative integer');
+    invariant(['latest_revision','first_settlement'].includes(mode),'CONFIG_INVALID','Invalid feedback trigger mode');
+    if(mode==='first_settlement'){
+      const row=this.db.prepare('SELECT MAX(event_id) AS event_id,MAX(received_at) AS received_at,COUNT(*) AS settled FROM first_settlements WHERE scope_id=? AND event_id>?').get(scopeId,afterEventId) as {event_id:number|null;received_at:number|null;settled:number};
+      return {eventId:row.event_id??afterEventId,receivedAt:row.received_at??0,settledTrajectories:row.settled};
+    }
     const row=this.db.prepare(`SELECT MAX(event_id) AS event_id,MAX(received_at) AS received_at,COUNT(DISTINCT CASE WHEN json_extract(data,'$.settled')=1 THEN json_extract(data,'$.trajectoryId') END) AS settled FROM feedback_latest WHERE scope_id=? AND event_id>?`).get(scopeId,afterEventId) as {event_id:number|null;received_at:number|null;settled:number};
     return {eventId:row.event_id??afterEventId,receivedAt:row.received_at??0,settledTrajectories:row.settled};
   }
@@ -493,14 +515,26 @@ export class SqliteStore implements DuelLoopStore {
       this.appendEvent('execution.intent',intent.scopeId,{decisionId:intent.decisionId,idempotencyKey:intent.command.idempotencyKey});
     });
   }
-  recordReceipt(receipt:ExecutionReceipt):void {
-    this.transaction(()=>{
+  recordReceipt(receipt:ExecutionReceipt):boolean {
+    return this.transaction(()=>{
       invariant(['accepted','completed','rejected','unknown'].includes(receipt.status)&&Number.isFinite(receipt.timestamp),'CONFIG_INVALID','Invalid receipt');
+      invariant(receipt.eventId===undefined||typeof receipt.eventId==='string'&&receipt.eventId.length>0,'CONFIG_INVALID','Receipt eventId must be nonempty');
+      const payload=canonicalize(receipt);
       const row=this.db.prepare('SELECT data FROM intents WHERE decision_id=? AND idem=?').get(receipt.decisionId,receipt.idempotencyKey) as any;
       invariant(row,'NOT_FOUND','No matching execution intent'); const intent=JSON.parse(row.data) as Intent;
-      if(intent.receipt&&['completed','rejected'].includes(intent.receipt.status)) {invariant(intent.receipt.status===receipt.status,'CONFLICT','Cannot change terminal execution status');return;}
+      if(receipt.eventId){
+        const previous=this.db.prepare('SELECT data FROM receipt_events WHERE decision_id=? AND event_id=?').get(receipt.decisionId,receipt.eventId) as {data:string}|undefined;
+        if(previous){invariant(previous.data===payload,'CONFLICT','Conflicting receipt event');return false;}
+      }
+      if(intent.receipt&&['completed','rejected'].includes(intent.receipt.status)) {
+        invariant(intent.receipt.status===receipt.status,'CONFLICT','Cannot change terminal execution status');
+        if(receipt.eventId)this.db.prepare('INSERT INTO receipt_events VALUES(?,?,?)').run(receipt.decisionId,receipt.eventId,payload);
+        return false;
+      }
+      if(receipt.eventId)this.db.prepare('INSERT INTO receipt_events VALUES(?,?,?)').run(receipt.decisionId,receipt.eventId,payload);
+      if(intent.receipt&&canonicalize(intent.receipt)===payload)return false;
       intent.receipt=receipt;this.db.prepare('UPDATE intents SET data=?,status=? WHERE decision_id=?').run(canonicalize(intent),receipt.status,receipt.decisionId);
-      this.appendEvent('execution.receipt',intent.scopeId,receipt);
+      this.appendEvent('execution.receipt',intent.scopeId,receipt);return true;
     });
   }
   intent(decisionId:string):Intent|undefined {const row=this.db.prepare('SELECT data FROM intents WHERE decision_id=?').get(decisionId) as {data:string}|undefined;return row?JSON.parse(row.data):undefined;}
@@ -524,7 +558,7 @@ export class SqliteStore implements DuelLoopStore {
       invariant(!existsSync(`${source}-wal`)||statSync(`${source}-wal`).size===0,'STORAGE_FAILURE','Restore requires a standalone consistent backup, not a database with pending WAL data');
       check=new DatabaseSync(source,{readOnly:true});
       const version=Number((check.prepare('PRAGMA user_version').get() as {user_version:number}).user_version);
-      invariant(version===1||version===2,'VERSION_INCOMPATIBLE','Backup schema is not supported',{version});
+      invariant(version===1||version===2||version===3,'VERSION_INCOMPATIBLE','Backup schema is not supported',{version});
       const required:Record<string,string[]>={
         artifacts:['digest','kind','visibility','data'],events:['id','type','scope_id','timestamp','visibility','data'],
         scopes:['id','active','paused','mode'],scope_owners:['scope_id','application_id'],releases:['digest','scope_id','data'],
@@ -533,7 +567,8 @@ export class SqliteStore implements DuelLoopStore {
         feedback:['scope_id','feedback_id','revision','received_at','data'],owners:['scope_id','stream_id','owner_id','token','pid','host'],
         intents:['decision_id','scope_id','stream_id','idem','data'],
       };
-      if(version===2){required.intents!.push('status');required.releases!.push('activated','invalid_reason','expected_active','validation_digest','last_deferral_id');required.feedback_latest=['scope_id','feedback_id','revision','received_at','event_id','data'];required.holdout_resources=['id','domain_id','protocol_digest','data'];required.holdout_caps=['id','cap'];required.holdout_seeds=['domain_id','seed','holdout_id'];}
+      if(version>=2){required.intents!.push('status');required.releases!.push('activated','invalid_reason','expected_active','validation_digest','last_deferral_id');required.feedback_latest=['scope_id','feedback_id','revision','received_at','event_id','data'];required.holdout_resources=['id','domain_id','protocol_digest','data'];required.holdout_caps=['id','cap'];required.holdout_seeds=['domain_id','seed','holdout_id'];}
+      if(version>=3){required.receipt_events=['decision_id','event_id','data'];required.first_settlements=['scope_id','trajectory_id','event_id','received_at'];}
       for(const [table,columns] of Object.entries(required)) {
         const actual=new Set((check.prepare(`PRAGMA table_info(${table})`).all() as {name:string}[]).map(row=>row.name));
         invariant(columns.every(column=>actual.has(column)),'STORAGE_FAILURE','Backup lacks required DuelLoop schema',{table});

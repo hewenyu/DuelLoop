@@ -57,7 +57,7 @@ try {
 
 ## 嵌入现有应用
 
-宿主拥有环境循环和执行权时，注入 `executionOwner: 'host'`，调用 `decide(observation, candidates?)`。不传候选动作时，SDK 调用领域的 `candidates()`。执行前调用 `prepareHostExecution()` 核对环境版本、取得唯一执行所有权并持久化执行意图；宿主再调用自己的业务环境执行，并提交回执和反馈：
+宿主拥有环境循环和执行权时，注入 `executionOwner: 'host'`，调用 `decide(observation, candidates?, { signal?, modelDeadline? })`。不传候选动作时，SDK 调用领域的 `candidates()`。执行前调用 `prepareHostExecution()` 核对环境版本、取得唯一执行所有权并持久化执行意图；宿主再调用自己的业务环境执行，并提交回执和反馈：
 
 ```js
 const app = new DuelLoop({ applicationId, domain, model, store, mode: 'simulation', executionOwner: 'host' });
@@ -72,6 +72,10 @@ await app.submitFeedback(feedbackEvents);
 ```
 
 `prepareHostExecution()` 只创建经核验且已持久化的命令，`recordHostReceipt()` 记录该意图的实际结果。宿主必须使用该命令和幂等键执行；未知结果应先核对，不能自行换键重发。影子模式不能准备执行，宿主模式不能调用框架的 `executeDecision()`。`DecisionRecord` 包含实际发布摘要、模型种类、输入、问题、回答、效用、动作概率及停止原因，可用于定位动作变化。
+
+`observation.deadline` 始终代表环境执行权限截止时间；有效模型截止时间单独保存在 `DecisionRecord.modelDeadline`，不会延长宿主传入的更早截止。每手开始可调用 `pinTrajectory({ strategyScopeId, streamId, actorId, trajectoryId })`，不必等首次行动才固定策略。调用级 signal 的自然取消只终止该次决策，不停止其他 stream；真实模型故障或超时仍停止实例。
+
+稳定回执提供 `eventId`，重复投递相同事件不会增加执行 journal；同 ID 不同内容拒绝。`SqliteStore.recordReceipt()` 返回是否更新状态，自定义 Store 实现也需要返回 boolean。`accepted` 仍是未解决状态，宿主必须依据环境实际完成证据提交 `completed`。完整恢复契约见 [实时集成](live-decision-contracts.md)。
 
 ## 模型与策略
 
@@ -126,12 +130,12 @@ if (result.releaseDigest) await app.activatePending('policy');
 
 | 契约 | 当前支持 | 不兼容时的处理 |
 | --- | --- | --- |
-| npm SDK | `0.2.1` 开发版，ESM，Node.js 24 | 当前 API 仍可能调整；V1.0 后遵循 SemVer |
+| npm SDK | `0.2.2` 开发版，ESM，Node.js 24 | 当前 API 仍可能调整；V1.0 后遵循 SemVer |
 | 应用配置 | `schemaVersion: "1.0"` | 拒绝未知版本、字段和非法组合 |
 | 策略 | `schemaVersion: "2.0"`，Score | 拒绝新语义、未知领域特征和不匹配的契约版本 |
 | 评价协议 | `version: "3.0"` | 创建研究前校验并固定摘要，不能事后换门槛 |
-| SQLite | `user_version = 2` | 空库初始化；Schema 1 原子迁移；未知较新版本拒绝 |
-| 领域、模型及运行器 | `duelloop-runtime-4` 与发布绑定中的完整行为依赖 | 依赖改变拒绝沿用既有验证，需重新评价 |
+| SQLite | `user_version = 3` | 空库初始化；Schema 1/2 原子迁移；未知较新版本拒绝 |
+| 领域、模型及运行器 | `duelloop-runtime-5` 与发布绑定中的完整行为依赖 | 依赖改变拒绝沿用既有验证，需重新评价 |
 
 失败停止后，当前实例不再接收新决策；再次调用 `start()` 不能清除该失败。先修复模型或输入问题，核对已有外部执行，关闭旧实例，再显式创建新的 `DuelLoop`。停止不撤销已经发出的动作，见[恢复流程](operations.md)。
 

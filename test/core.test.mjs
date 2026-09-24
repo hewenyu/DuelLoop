@@ -189,12 +189,16 @@ test('concurrent framework or host submissions atomically claim exactly one inte
     await x.runtime.close();x.store.close();
   }
 });
-test('embedded decisions persist the runtime deadline and reject delayed execution',async()=>{
-  const x=setup({maxDecisionMs:80,executionReserveMs:5});
-  const o=await x.domain.observe('a');const d=await x.runtime.decide({...o,deadline:Date.now()+30000});
-  assert.ok(d.observation.deadline<=d.startedAt+80);
-  await new Promise(r=>setTimeout(r,Math.max(0,d.observation.deadline-Date.now())+5));
-  await assert.rejects(()=>x.runtime.executeDecision(d),{code:'STATE_STALE'});assert.equal(x.store.intents().length,0);
+test('embedded decisions retain authority after their model cutoff and reject expired authority',async()=>{
+  const x=setup({maxDecisionMs:200,executionReserveMs:5});
+  const o=await x.domain.observe('a');const authority=Date.now()+1000;
+  const d=await x.runtime.decide({...o,deadline:authority});
+  assert.equal(d.observation.deadline,authority);assert.ok(d.modelDeadline<=d.startedAt+195);
+  await new Promise(r=>setTimeout(r,Math.max(0,d.modelDeadline-Date.now())+5));
+  const receipt=await x.runtime.executeDecision(d);assert.equal(receipt.status,'completed');
+  const next=await x.domain.observe('a');const expired=await x.runtime.decide({...next,deadline:Date.now()+150});
+  await new Promise(r=>setTimeout(r,Math.max(0,expired.observation.deadline-Date.now())+5));
+  await assert.rejects(()=>x.runtime.executeDecision(expired),{code:'STATE_STALE'});assert.equal(x.store.intents().length,1);
   await x.runtime.close();x.store.close();
 });
 test('application boundaries cover feedback, activation and reconciliation',async()=>{

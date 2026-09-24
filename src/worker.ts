@@ -1,7 +1,7 @@
 import { DuelLoopError, invariant } from './errors.js';
 import { validateProtocol } from './evaluation.js';
 import { digest } from './utils.js';
-import type { DuelLoopStore, EvaluationProtocol } from './types.js';
+import type { DuelLoopStore, EvaluationProtocol, FeedbackTriggerMode } from './types.js';
 import { ResearchOrchestrator, type ResearchResult } from './research.js';
 
 type WorkerState='idle'|'running'|'waiting_protocol'|'stopped'|'error';
@@ -9,6 +9,8 @@ export interface ResearchWorkerOptions {
   orchestrator:ResearchOrchestrator; store:DuelLoopStore; scopeId:string;
   protocol:EvaluationProtocol; developmentProtocol:EvaluationProtocol;
   settledTrajectories:number; cooldownMs:number;
+  /** Whether revised settlements count as new trigger evidence. Defaults to latest_revision. */
+  feedbackTriggerMode?:FeedbackTriggerMode;
   /** Rolling evidence window; older feedback outside this window is coalesced. */
   snapshotOptions?:{maxDecisions?:number;maxFeedback?:number};
   /** Notification only. The runtime independently schedules registered pending releases. */
@@ -22,6 +24,7 @@ export class ResearchWorker {
   constructor(private readonly options:ResearchWorkerOptions){
     invariant(Number.isSafeInteger(options.settledTrajectories)&&options.settledTrajectories>0&&Number.isFinite(options.cooldownMs)&&options.cooldownMs>=0,'CONFIG_INVALID','Invalid research trigger');
     for(const limit of [options.snapshotOptions?.maxDecisions,options.snapshotOptions?.maxFeedback])invariant(limit===undefined||(Number.isSafeInteger(limit)&&limit>0&&limit<=10000),'CONFIG_INVALID','Snapshot limits must be positive integers up to 10000');
+    invariant(options.feedbackTriggerMode===undefined||['latest_revision','first_settlement'].includes(options.feedbackTriggerMode),'CONFIG_INVALID','Invalid feedback trigger mode');
     this.protocols=this.validateProtocols(options);
   }
   private validateProtocols(input:{protocol:EvaluationProtocol;developmentProtocol:EvaluationProtocol}) {
@@ -84,13 +87,13 @@ export class ResearchWorker {
       // already committed feedback without loading their historical snapshots.
       const previousData=previous?.data as {feedbackEventId?:number}|undefined;
       const afterEventId=typeof previousData?.feedbackEventId==='number'?previousData.feedbackEventId:previous?.id??0;
-      const progress=store.feedbackProgress(scopeId,afterEventId);
+      const progress=store.feedbackProgress(scopeId,afterEventId,this.options.feedbackTriggerMode);
       if(progress.settledTrajectories<this.options.settledTrajectories)return null;
       // receivedAt belongs to the host. The journal cursor decides freshness even when
       // timestamps repeat or arrive out of order; include every already committed input.
       const cutoff=Math.max(Date.now(),progress.receivedAt);
       const feedbackEventId=progress.eventId;
-      const run=orchestrator.create({scopeId,...protocols,snapshotOptions:this.options.snapshotOptions,trigger:{feedbackEventId,cutoff,settledTrajectories:progress.settledTrajectories}});
+      const run=orchestrator.create({scopeId,...protocols,snapshotOptions:this.options.snapshotOptions,trigger:{feedbackEventId,cutoff,settledTrajectories:progress.settledTrajectories,feedbackTriggerMode:this.options.feedbackTriggerMode??'latest_revision'}});
       this.activeRun=run.id;this.state='running';
       const result=await orchestrator.run(run.id);
       if(result.run.status==='waiting_protocol'){this.waiting(protocols.protocol);return result;}

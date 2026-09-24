@@ -17,6 +17,8 @@ export interface ExecutionReceipt {
   decisionId: string; idempotencyKey: string;
   status: 'accepted' | 'completed' | 'rejected' | 'unknown';
   timestamp: number; environmentActionId?: string; details?: Features;
+  /** Stable host event identity; duplicates must have the same canonical payload. */
+  eventId?: string;
 }
 export interface FeedbackEvent {
   feedbackId: string; revision: number; eventTime: number; receivedAt: number;
@@ -89,6 +91,15 @@ export interface ReleaseBinding {
   expectedActiveDigest: string | null; validationDigest: string | null;
   source: 'bootstrap' | 'research'; researchRunId?: string;
 }
+export interface DecisionOptions {
+  signal?: AbortSignal;
+  /** Absolute model cutoff; does not replace observation.deadline (action authority). */
+  modelDeadline?: number;
+}
+export interface TrajectoryIdentity {
+  strategyScopeId: string; streamId: string; actorId: string; trajectoryId: string;
+}
+export type FeedbackTriggerMode = 'latest_revision' | 'first_settlement';
 export interface DecisionRecord {
   decisionId: string; observation: Observation; candidates: CandidateAction[];
   releaseDigest: string; strategyDigest: string; decisionSource: DecisionSource;
@@ -96,6 +107,7 @@ export interface DecisionRecord {
   branchId?: string; questions: ScoreQuestion[]; answers: Record<string, ScoreAnswer>;
   utilities: Record<string, number>; probabilities: Record<string, number>;
   model?: string; modelKind?: 'real' | 'fixture'; usage?: ModelUsage;
+  modelDeadline?: number;
   startedAt: number; finishedAt: number; randomSeed?: string; modelLatencyMs?: number;
 }
 export type RunStatus = 'created' | 'researching' | 'development_evaluating' | 'candidate_locked'
@@ -200,6 +212,7 @@ export interface DuelLoopStore {
   setActivationMode(scopeId: string, mode: 'candidate_only' | 'automatic_after_validation' | 'explicit'): void;
   pauseActivation(scopeId: string, paused: boolean): void;
   invalidateValidation(validationDigest: string, reason: string): void;
+  lookupTrajectoryRelease(scopeId: string, streamId: string, actorId: string, trajectoryId: string): string | undefined;
   trajectoryRelease(scopeId: string, streamId: string, actorId: string, trajectoryId: string): string;
   createRun(run: Omit<ResearchRun, 'revision' | 'createdAt' | 'updatedAt' | 'counters'>): ResearchRun;
   getRun(id: string): ResearchRun;
@@ -215,14 +228,14 @@ export interface DuelLoopStore {
   registerHoldout(protocol: EvaluationProtocol): void;
   recordFeedback(feedback: FeedbackEvent): void;
   latestFeedback(scopeId: string, options?: { afterEventId?: number; cutoff?: number }): { eventId: number; feedback: FeedbackEvent }[];
-  feedbackProgress(scopeId: string, afterEventId: number): { eventId: number; receivedAt: number; settledTrajectories: number };
+  feedbackProgress(scopeId: string, afterEventId: number, mode?: FeedbackTriggerMode): { eventId: number; receivedAt: number; settledTrajectories: number };
   snapshot(scopeId: string, cutoff: number, options?: { maxDecisions?: number; maxFeedback?: number }): string;
   acquireOwner(scopeId: string, streamId: string, ownerId: string): string;
   releaseOwner(scopeId: string, streamId: string, ownerToken: string): void;
   assertOwner(scopeId: string, streamId: string, ownerToken: string): void;
   /** Atomically claim a new submission. Reject duplicate or unresolved stream intents. */
   saveIntent(intent: Intent): void;
-  recordReceipt(receipt: ExecutionReceipt): void;
+  recordReceipt(receipt: ExecutionReceipt): boolean;
   intents(scopeId?: string): Intent[];
   intent(decisionId: string): Intent | undefined;
   unresolvedIntents(scopeId?: string, streamId?: string): Intent[];

@@ -242,9 +242,11 @@ async function simulate(factory: (options: SimulationOptions) => DomainDefinitio
     const observation = await domain.observe('evaluation'); const candidates = await domain.candidates(observation);
     const started = Date.now();
     const request = buildQuestions(strategy, observation, candidates, domain); result.modelCalls++;
-    const response = await withDeadline(observation.deadline - reserve, signal => input.model.score({ state: request.state, questions: request.questions, signal }), input.signal);
+    const modelDeadline = Math.min(observation.deadline - reserve, started + maxDecisionMs - reserve);
+    const response = await withDeadline(modelDeadline, signal => input.model.score({ state: request.state, questions: request.questions, signal }), input.signal);
     invariant(response.model === input.model.id || input.model.kind === 'fixture', 'VERSION_INCOMPATIBLE', 'Evaluation model returned a different version');
     accumulateModelUsage(result.usage!, response.usage);
+    invariant(Date.now() < modelDeadline, 'MODEL_TIMEOUT', 'Evaluation model deadline expired');
     const action = evaluateAnswers(strategy, observation, candidates, response.answers, timing.randomSeed === undefined ? random : seededRandom(`${timing.randomSeed}:${observation.trajectoryId}:${observation.revision}`)).action;
     invariant(!input.signal.aborted, 'CANCELLED', 'Evaluation cancelled');
     result.decisions++; result.decisionComputeLatenciesMs.push(Date.now() - started);

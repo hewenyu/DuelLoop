@@ -57,7 +57,7 @@ test('database page limit rejects growth without pruning and survives reopen and
   finally { restored.close(); }
 });
 test('quota failures in event and feedback writes retain prior events and rollback partial feedback', t => {
-  const dir = directory(t); const path = join(dir, 'events.sqlite'); const store = new SqliteStore(path, { maxDatabaseBytes: 192 * 1024 });
+  const dir = directory(t); const path = join(dir, 'events.sqlite'); const store = new SqliteStore(path, { maxDatabaseBytes: 256 * 1024 });
   try {
     store.appendEvent('existing', 'scope', { keep: true });
     assert.throws(() => store.appendEvent('too-large', 'scope', { payload: 'x'.repeat(1024 * 1024) }), { code: 'STORAGE_FAILURE' });

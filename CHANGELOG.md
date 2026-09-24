@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 — 宿主实时决策契约
+
+- `decide` 支持逐调用 AbortSignal 和绝对 modelDeadline；模型取消不会误停其他 stream，实际模型失败仍停止。权限 deadline 不再被模型预算覆盖。
+- `pinTrajectory` 支持首个决策前持久绑定策略；runtime 5 明确新的时间行为，旧发布需要重新绑定和验证。
+- 回执支持稳定 eventId 与持久去重，冲突不能覆盖，重复旧事件不能降级终态；自定义 Store 的 recordReceipt 现在返回 boolean。
+- ResearchWorker 可选择 first_settlement，仅新结算轨迹触发；修订仍保留在快照，默认继续使用 latest_revision。
+- SQLite Schema 3 原子迁移，保留历史证据并补齐首次结算 ledger；共享同库进程必须一起升级。没有新增金额准入或真实模型调用。
+
 ## 0.2.1 — SDK 审计修复
 
 - Pi 每次内部模型发送前复核持久研究状态，跨实例取消阻止工具续问与格式修复继续发送；保留已经发生的用量，禁用绕过检查的传输重试。

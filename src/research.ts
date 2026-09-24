@@ -128,7 +128,7 @@ export class ResearchOrchestrator {
     const availability=this.protocolAvailability(protocol);
     invariant(availability.remaining>0,'HOLDOUT_UNAVAILABLE','Final evaluation resource exhausted; configure an independent new protocol before research',{holdoutId:protocol.holdoutId,...availability});
   }
-  create(input: { id?: string; scopeId: string; protocol: EvaluationProtocol; developmentProtocol?: EvaluationProtocol; snapshotId?: string; snapshotOptions?:{maxDecisions?:number;maxFeedback?:number}; trigger?:{feedbackEventId:number;cutoff:number;settledTrajectories:number} }): ResearchRun {
+  create(input: { id?: string; scopeId: string; protocol: EvaluationProtocol; developmentProtocol?: EvaluationProtocol; snapshotId?: string; snapshotOptions?:{maxDecisions?:number;maxFeedback?:number}; trigger?:{feedbackEventId:number;cutoff:number;settledTrajectories:number;feedbackTriggerMode?:'latest_revision'|'first_settlement'} }): ResearchRun {
     const { store, domain } = this.options;
     if(input.trigger)invariant(Number.isSafeInteger(input.trigger.feedbackEventId)&&input.trigger.feedbackEventId>0&&Number.isFinite(input.trigger.cutoff)&&Number.isSafeInteger(input.trigger.settledTrajectories)&&input.trigger.settledTrajectories>0,'CONFIG_INVALID','Invalid research trigger cursor');
     for(const limit of [input.snapshotOptions?.maxDecisions,input.snapshotOptions?.maxFeedback])invariant(limit===undefined||(Number.isSafeInteger(limit)&&limit>0&&limit<=10000),'CONFIG_INVALID','Snapshot limits must be positive integers up to 10000');
