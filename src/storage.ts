@@ -57,6 +57,7 @@ export class SqliteStore implements DuelLoopStore {
       CREATE TABLE IF NOT EXISTS invalid_validations (digest TEXT PRIMARY KEY, reason TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS trajectories (scope_id TEXT NOT NULL, stream_id TEXT NOT NULL, actor_id TEXT NOT NULL, trajectory_id TEXT NOT NULL, release_digest TEXT NOT NULL, PRIMARY KEY(scope_id,stream_id,actor_id,trajectory_id));
       CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, status TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS runs_scope_created ON runs(scope_id);
       CREATE TABLE IF NOT EXISTS holdout_uses (holdout_id TEXT NOT NULL, run_id TEXT NOT NULL, PRIMARY KEY(holdout_id,run_id));
       CREATE TABLE IF NOT EXISTS feedback (scope_id TEXT NOT NULL, feedback_id TEXT NOT NULL, revision INTEGER NOT NULL, received_at INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(scope_id,feedback_id,revision));
       CREATE TABLE IF NOT EXISTS owners (scope_id TEXT NOT NULL, stream_id TEXT NOT NULL, owner_id TEXT NOT NULL, token TEXT NOT NULL, pid INTEGER NOT NULL, host TEXT NOT NULL, PRIMARY KEY(scope_id,stream_id));
@@ -349,7 +350,13 @@ export class SqliteStore implements DuelLoopStore {
     });
   }
   getRun(id:string):ResearchRun { const row=this.db.prepare('SELECT data FROM runs WHERE id=?').get(id) as any; invariant(row,'NOT_FOUND','Research run missing',{researchRunId:id}); return JSON.parse(row.data); }
-  listRuns(scopeId?:string):ResearchRun[] { return (this.db.prepare(`SELECT data FROM runs ${scopeId===undefined?'':'WHERE scope_id=?'} ORDER BY rowid`).all(...(scopeId===undefined?[]:[scopeId])) as {data:string}[]).map(r=>JSON.parse(r.data)); }
+  listRuns(scopeId?:string,options:{limit?:number;descending?:boolean}={}):ResearchRun[] {
+    invariant(options.limit===undefined||Number.isSafeInteger(options.limit)&&options.limit>0,'CONFIG_INVALID','Run limit must be a positive integer');
+    invariant(options.descending===undefined||typeof options.descending==='boolean','CONFIG_INVALID','Run order must be boolean');
+    const parameters:(string|number)[]=scopeId===undefined?[]:[scopeId];
+    if(options.limit!==undefined)parameters.push(options.limit);
+    return (this.db.prepare(`SELECT data FROM runs ${scopeId===undefined?'':'WHERE scope_id=?'} ORDER BY rowid ${options.descending?'DESC':'ASC'} ${options.limit===undefined?'':'LIMIT ?'}`).all(...parameters) as {data:string}[]).map(row=>JSON.parse(row.data));
+  }
   activeRun(scopeId:string):ResearchRun|undefined {
     const row=this.db.prepare(`SELECT data FROM runs WHERE scope_id=? AND ${ACTIVE_RUN_SQL} LIMIT 1`).get(scopeId) as {data:string}|undefined;
     return row?JSON.parse(row.data):undefined;

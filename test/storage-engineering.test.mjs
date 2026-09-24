@@ -220,3 +220,18 @@ test('current rolling evidence follows committed feedback cursors despite old ho
   assert.equal(complete.window.feedbackTruncated, false);
   assert.equal(complete.window.decisionsTruncated, false);
 });
+
+
+test('recent research status reads apply scope, ordering and limit before decoding historical JSON',t=>{
+ const path=location(t),store=new SqliteStore(path);t.after(()=>store.close());
+ const db=new DatabaseSync(path);t.after(()=>db.close());
+ const insert=db.prepare('INSERT INTO runs VALUES(?,?,?,?,?)');
+ insert.run('corrupt-old','scope','no_change',0,'not JSON');
+ for(let index=0;index<25;index++)insert.run(`recent-${index}`,'scope','no_change',0,JSON.stringify({id:`recent-${index}`}));
+ insert.run('other','other-scope','no_change',0,'not JSON');
+ assert.deepEqual(store.listRuns('scope',{limit:3,descending:true}).map(run=>run.id),['recent-24','recent-23','recent-22']);
+ assert.throws(()=>store.listRuns('scope',{limit:0}),{code:'CONFIG_INVALID'});
+ const plan=db.prepare('EXPLAIN QUERY PLAN SELECT data FROM runs WHERE scope_id=? ORDER BY rowid DESC LIMIT ?').all('scope',3);
+ assert(plan.some(row=>row.detail.includes('runs_scope_created')),JSON.stringify(plan));
+ assert(!plan.some(row=>row.detail.includes('TEMP B-TREE')),JSON.stringify(plan));
+});

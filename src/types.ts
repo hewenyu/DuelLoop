@@ -216,7 +216,7 @@ export interface DuelLoopStore {
   trajectoryRelease(scopeId: string, streamId: string, actorId: string, trajectoryId: string): string;
   createRun(run: Omit<ResearchRun, 'revision' | 'createdAt' | 'updatedAt' | 'counters'>): ResearchRun;
   getRun(id: string): ResearchRun;
-  listRuns(scopeId?: string): ResearchRun[];
+  listRuns(scopeId?: string, options?: { limit?: number; descending?: boolean }): ResearchRun[];
   activeRun(scopeId: string): ResearchRun | undefined;
   transitionRun(id: string, expected: RunStatus[], next: RunStatus, data?: Record<string, Json>): ResearchRun;
   recordFinalValidation(id: string, report: ValidationReport, evidenceDigest?: string): ResearchRun;

@@ -61,3 +61,11 @@ early pin across activation/restart, persistent receipt dedup/conflict/terminal
 ordering, first-settlement revisions, schema migration, package consumption, and
 existing regression suites. Back up before migration; all processes sharing the
 store must upgrade together. Schema 3 cannot be reopened by 0.2.1.
+
+## Bounded research status reads
+
+Application status polling must not materialize every historical research run.
+`listRuns(scopeId?, { limit?, descending? })` pushes the limit and creation-order
+sort into SQLite. Defaults preserve ascending creation order and all results.
+A scope-only index supports recent bounded status reads without sorting its entire
+history; this is creation order, not an updated-at ordering claim.
