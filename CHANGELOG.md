@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3 — 显式 bootstrap 模型维护
+
+- 增加 `DuelLoop.rebindBootstrapModel()` 与可选存储能力：已停止、排空的宿主可用明确的检查证据为原 scope 的同一 bootstrap 策略绑定新模型行为摘要。
+- `maintenance` 发布独立记录前一发布、证据和操作事件；只允许 `modelBehaviorDigest` 变化，不产生研究验证或盈利声明。当前发布比较替换、登记和审计在同一事务完成；存在研究任务、未决执行或存活执行所有者时拒绝。
+- 历史发布、轨迹绑定、验证及保留集额度保持不变；正常资格检查验证维护证据链，备份和完整性检查保留维护引用。SQLite Schema 3 和 runtime 5 不变；旧 SDK 不认可 maintenance 发布，共享同库进程需一起升级。
+
 ## 0.2.2 — 宿主实时决策契约
 
 - `decide` 支持逐调用 AbortSignal 和绝对 modelDeadline；模型取消不会误停其他 stream，实际模型失败仍停止。权限 deadline 不再被模型预算覆盖。

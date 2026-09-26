@@ -5,7 +5,7 @@ import { hostname } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { invariant, DuelLoopError } from './errors.js';
 import { canonicalize, digest, jsonValue } from './utils.js';
-import type { Artifact, BehaviorDependencies, CandidateSubmission, DecisionRecord, DuelLoopStore, EvaluationProtocol, ExecutionMode, ExecutionReceipt, FeedbackEvent, FeedbackTriggerMode, Intent, JournalEvent, Json, ReleaseBinding, ResearchRun, RunStatus, ScopeStatus, ValidationReport } from './types.js';
+import type { Artifact, BehaviorDependencies, CandidateSubmission, DecisionRecord, DuelLoopStore, EvaluationProtocol, ExecutionMode, ExecutionReceipt, FeedbackEvent, FeedbackTriggerMode, Intent, JournalEvent, Json, ModelMaintenanceEvidence, ModelMaintenanceOptions, ReleaseBinding, ResearchRun, RunStatus, ScopeStatus, ValidationReport } from './types.js';
 
 const TERMINAL = new Set<RunStatus>(['cancelled','no_change','budget_exhausted','completed_passed','completed_failed','completed_inconclusive','error','waiting_protocol']);
 const ACTIVE_RUN_SQL="status IN ('created','researching','development_evaluating','candidate_locked','final_evaluating','validated_pending_release','cancel_requested')";
@@ -183,7 +183,7 @@ export class SqliteStore implements DuelLoopStore {
       const timestamp=Date.now(); const encoded=canonicalize(data);
       const result=this.db.prepare('INSERT INTO events(type,scope_id,timestamp,visibility,data) VALUES(?,?,?,?,?)').run(type,scopeId,timestamp,visibility,encoded);
       const event={id:Number(result.lastInsertRowid),type,scopeId,timestamp,data:JSON.parse(encoded),visibility};
-      if(type==='release.activated'||type==='release.rolled_back')this.db.prepare('UPDATE releases SET activated=1 WHERE digest=? AND scope_id=?').run(event.data.releaseDigest,scopeId);
+      if(type==='release.activated'||type==='release.rolled_back'||type==='release.model_maintenance')this.db.prepare('UPDATE releases SET activated=1 WHERE digest=? AND scope_id=?').run(event.data.releaseDigest,scopeId);
       if(type==='release.invalid')this.db.prepare('UPDATE releases SET invalid_reason=? WHERE digest=? AND scope_id=?').run(String(event.data.reason??'invalid'),event.data.releaseDigest,scopeId);
       if(type==='release.deferred')this.db.prepare('UPDATE releases SET last_deferral_id=? WHERE digest=? AND scope_id=?').run(event.id,event.data.releaseDigest,scopeId);
       return event;
@@ -203,6 +203,8 @@ export class SqliteStore implements DuelLoopStore {
   latestEvent(scopeId:string,type:string,options:{allowPrivate?:boolean}={}):JournalEvent|undefined {return this.events({scopeId,types:[type],limit:1,descending:true,...options})[0];}
   registerRelease(binding:ReleaseBinding):string {
     return this.transaction(()=>{
+      invariant(binding.source==='bootstrap'||binding.source==='research','CONFIG_INVALID','Maintenance releases require the explicit rebind operation');
+      invariant(binding.previousReleaseDigest===undefined&&binding.evidenceDigest===undefined,'CONFIG_INVALID','Maintenance fields require a maintenance release');
       this.getArtifact(binding.strategyDigest);
       if (binding.source==='research') {
         invariant(binding.researchRunId && binding.validationDigest, 'VALIDATION_REJECTED', 'Research release needs run and validation');
@@ -215,6 +217,65 @@ export class SqliteStore implements DuelLoopStore {
       this.db.prepare('INSERT OR IGNORE INTO scopes(id) VALUES(?)').run(binding.scopeId);
       return hash;
     });
+  }
+  /** Explicit maintenance is atomic and never rewrites a historical release or research report. */
+  rebindBootstrapModel(scopeId:string,dependencies:BehaviorDependencies,options:ModelMaintenanceOptions):string {
+    invariant(typeof scopeId==='string'&&scopeId.length>0&&options&&typeof options==='object','CONFIG_INVALID','Maintenance scope and options required');
+    invariant(Object.keys(options).every(key=>['expectedReleaseDigest','evidenceDigest'].includes(key))&&
+      typeof options.expectedReleaseDigest==='string'&&options.expectedReleaseDigest.length>0&&
+      typeof options.evidenceDigest==='string'&&options.evidenceDigest.length>0,'CONFIG_INVALID','Maintenance requires the expected release and evidence digest');
+    return this.transaction(()=>{
+      invariant(this.activeRelease(scopeId)===options.expectedReleaseDigest,'CONFLICT','Maintenance baseline is no longer active');
+      invariant(!this.activeRun(scopeId),'CONFLICT','Maintenance requires research to be drained');
+      invariant(this.unresolvedIntents(scopeId).length===0,'EXECUTION_UNKNOWN','Maintenance requires all execution intents to be reconciled');
+      // A live/remote execution owner could create an intent immediately after this transaction.
+      for(const owner of this.db.prepare('SELECT pid,host FROM owners WHERE scope_id=?').all(scopeId) as {pid:number;host:string}[]) {
+        let alive=true;
+        if(owner.host===hostname())try{process.kill(owner.pid,0);}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')alive=false;}
+        invariant(!alive,'CONFLICT','Maintenance requires execution owners to be closed');
+      }
+      const previous=this.release(options.expectedReleaseDigest);
+      const binding:ReleaseBinding={source:'maintenance',scopeId,strategyDigest:previous.strategyDigest,
+        dependencies:structuredClone(dependencies),expectedActiveDigest:options.expectedReleaseDigest,validationDigest:null,
+        previousReleaseDigest:options.expectedReleaseDigest,evidenceDigest:options.evidenceDigest};
+      this.assertMaintenanceBinding(binding);
+      const hash=this.putArtifact('release',binding);
+      this.db.prepare('INSERT INTO releases(digest,scope_id,data,expected_active,validation_digest) VALUES(?,?,?,?,NULL)')
+        .run(hash,scopeId,canonicalize(binding),options.expectedReleaseDigest);
+      const changed=this.db.prepare('UPDATE scopes SET active=? WHERE id=? AND active=?').run(hash,scopeId,options.expectedReleaseDigest);
+      invariant(changed.changes===1,'CONFLICT','Maintenance baseline changed before activation');
+      this.appendEvent('release.model_maintenance',scopeId,{releaseDigest:hash,previousReleaseDigest:options.expectedReleaseDigest,
+        strategyDigest:binding.strategyDigest,evidenceDigest:options.evidenceDigest,
+        previousDependencies:previous.dependencies,newDependencies:binding.dependencies},'private');
+      this.assertReleaseEligible(hash,dependencies);
+      return hash;
+    });
+  }
+  private assertMaintenanceBinding(binding:ReleaseBinding):void {
+    invariant(binding.source==='maintenance'&&typeof binding.previousReleaseDigest==='string'&&typeof binding.evidenceDigest==='string'&&
+      binding.expectedActiveDigest===binding.previousReleaseDigest&&binding.validationDigest===null&&binding.researchRunId===undefined,
+      'VALIDATION_REJECTED','Maintenance release has invalid provenance');
+    const previous=this.release(binding.previousReleaseDigest);
+    invariant(previous.source==='bootstrap'&&previous.validationDigest===null&&previous.researchRunId===undefined&&
+      previous.scopeId===binding.scopeId&&previous.strategyDigest===binding.strategyDigest,
+      'VALIDATION_REJECTED','Maintenance can only preserve the same unvalidated bootstrap strategy');
+    this.assertReleaseEligible(binding.previousReleaseDigest,previous.dependencies);
+    const {modelBehaviorDigest:before,...oldDependencies}=previous.dependencies;
+    const {modelBehaviorDigest:after,...newDependencies}=binding.dependencies;
+    invariant(typeof before==='string'&&typeof after==='string'&&after.length>0&&before!==after&&digest(oldDependencies)===digest(newDependencies),
+      'VERSION_INCOMPATIBLE','Maintenance may change only the model behavior digest');
+    const evidence=this.getArtifact<ModelMaintenanceEvidence>(binding.evidenceDigest,{allowPrivate:true});
+    const artifact=this.db.prepare('SELECT kind FROM artifacts WHERE digest=?').get(binding.evidenceDigest) as {kind:string};
+    invariant(artifact.kind==='model_maintenance_evidence'&&evidence&&evidence.schemaVersion==='1.0'&&evidence.kind==='bootstrap_model_maintenance'&&
+      evidence.scopeId===binding.scopeId&&evidence.previousReleaseDigest===binding.previousReleaseDigest&&evidence.strategyDigest===binding.strategyDigest&&
+      digest(evidence.previousDependencies)===digest(previous.dependencies)&&digest(evidence.newDependencies)===digest(binding.dependencies)&&
+      typeof evidence.reason==='string'&&evidence.reason.trim().length>0&&Number.isFinite(evidence.createdAt)&&evidence.createdAt>0&&
+      Array.isArray(evidence.checks)&&evidence.checks.length>0,'VALIDATION_REJECTED','Maintenance evidence does not match the release');
+    for(const check of evidence.checks) {
+      invariant(check&&typeof check.name==='string'&&check.name.trim().length>0&&check.passed===true&&typeof check.artifactDigest==='string',
+        'VALIDATION_REJECTED','Maintenance requires successful, referenced verification reports');
+      this.getArtifact(check.artifactDigest,{allowPrivate:true});
+    }
   }
   release(hash:string):ReleaseBinding {
     const row=this.db.prepare('SELECT data FROM releases WHERE digest=?').get(hash) as any;
@@ -266,6 +327,12 @@ export class SqliteStore implements DuelLoopStore {
     const binding=this.release(hash);
     invariant(digest(dependencies)===digest(binding.dependencies),'VERSION_INCOMPATIBLE','Behavior dependencies changed');
     this.getArtifact(binding.strategyDigest);
+    if(binding.source==='maintenance') {
+      this.assertMaintenanceBinding(binding);
+      const committed=this.db.prepare('SELECT activated FROM releases WHERE digest=?').get(hash) as {activated:number};
+      invariant(committed.activated===1,'VALIDATION_REJECTED','Maintenance release was not committed by its dedicated operation');
+      return;
+    }
     if(binding.validationDigest){
       invariant(!this.db.prepare('SELECT 1 FROM invalid_validations WHERE digest=?').get(binding.validationDigest),'VALIDATION_REJECTED','Validation eligibility revoked');
       const report=this.getArtifact<ValidationReport>(binding.validationDigest,{allowPrivate:true});
@@ -275,6 +342,7 @@ export class SqliteStore implements DuelLoopStore {
   activate(hash:string,dependencies:BehaviorDependencies,options:{explicit?:boolean}={}):void {
     this.transaction(()=>{
       const binding=this.release(hash); const scope=this.db.prepare('SELECT * FROM scopes WHERE id=?').get(binding.scopeId) as any;
+      invariant(binding.source!=='maintenance','VALIDATION_REJECTED','Maintenance releases require the explicit rebind operation');
       invariant(scope,'NOT_FOUND','Activation scope missing');
       invariant(!scope.paused,'ACTIVATION_DEFERRED','Activation paused',{reason:'activation_paused'});
       invariant(scope.mode!=='candidate_only','ACTIVATION_DEFERRED','Candidate-only mode does not activate releases',{reason:'candidate_only'});
@@ -617,6 +685,13 @@ export class SqliteStore implements DuelLoopStore {
       for(const row of check.prepare('SELECT digest,data FROM releases').all() as {digest:string;data:string}[]) {
         const binding=JSON.parse(row.data) as ReleaseBinding;
         invariant(digest(binding)===row.digest&&artifacts.has(binding.strategyDigest)&&(!binding.validationDigest||artifacts.has(binding.validationDigest)),'STORAGE_FAILURE','Backup release evidence is incomplete',{digest:row.digest});
+        if(binding.source==='maintenance') {
+          invariant(binding.evidenceDigest&&artifacts.has(binding.evidenceDigest)&&binding.previousReleaseDigest&&
+            check.prepare('SELECT 1 FROM releases WHERE digest=?').get(binding.previousReleaseDigest),'STORAGE_FAILURE','Backup maintenance evidence is incomplete',{digest:row.digest});
+          const evidence=JSON.parse((check.prepare('SELECT data FROM artifacts WHERE digest=?').get(binding.evidenceDigest) as {data:string}).data) as ModelMaintenanceEvidence;
+          invariant(Array.isArray(evidence.checks)&&evidence.checks.length>0&&evidence.checks.every(item=>item&&artifacts.has(item.artifactDigest)),
+            'STORAGE_FAILURE','Backup maintenance check reports are incomplete',{digest:row.digest});
+        }
       }
     }catch(error){if(error instanceof DuelLoopError)throw error;throw new DuelLoopError('STORAGE_FAILURE','Backup could not be read or validated');}
     finally{check?.close();}
@@ -626,7 +701,7 @@ export class SqliteStore implements DuelLoopStore {
     const issues:string[]=[];
     const result=this.db.prepare('PRAGMA integrity_check').get() as any;if(result.integrity_check!=='ok')issues.push(String(result.integrity_check));
     for(const r of this.db.prepare('SELECT digest,data FROM artifacts').all() as any[])try{if(digest(JSON.parse(r.data))!==r.digest)issues.push(`artifact:${r.digest}`);}catch{issues.push(`artifact:${r.digest}`);}
-    for(const r of this.db.prepare('SELECT digest FROM releases').all() as any[])try{const b=this.release(r.digest);this.getArtifact(b.strategyDigest);if(b.validationDigest)this.getArtifact(b.validationDigest,{allowPrivate:true});}catch{issues.push(`release:${r.digest}`);}
+    for(const r of this.db.prepare('SELECT digest FROM releases').all() as any[])try{const b=this.release(r.digest);this.getArtifact(b.strategyDigest);if(b.validationDigest)this.getArtifact(b.validationDigest,{allowPrivate:true});if(b.source==='maintenance')this.assertReleaseEligible(r.digest,b.dependencies);}catch{issues.push(`release:${r.digest}`);}
     return {ok:issues.length===0,issues};
   }
   pruneUnreferencedArtifacts(options:{dryRun?:boolean;kinds?:string[]}={}):{dryRun:boolean;digests:string[]} {

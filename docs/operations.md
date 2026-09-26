@@ -73,6 +73,38 @@ restored.close();
 
 升级前保留数据库备份与旧实验。历史 JSON 和反馈不做覆盖迁移；旧发布、轨迹绑定及验证报告也不获得新运行资格。使用新策略、新协议及当前行为依赖重新验证和登记发布；需要新的应用/作用域承接时由宿主显式选择，并正确接回环境和处理在途轨迹。不能删除数据库、清零保留集额度或把旧报告改写为新版来完成迁移。最终保留集已使用的实验，需要独立的新评价设计和新数据。
 
+## 显式 bootstrap 模型维护
+
+0.2.3 为宿主提供 `app.rebindBootstrapModel(scopeId, { expectedReleaseDigest, evidenceDigest })`。它只适用于已由宿主选择、尚无研究验证的 bootstrap 策略：策略摘要、应用、scope、模型 ID/种类、运行器及领域依赖完全不变，唯独模型行为摘要发生改变，例如经过验证的传输重试修复。它不接收替代策略，不延续旧研究资格，不运行模型，也不声称策略或盈利能力改善。研究来源发布、maintenance 来源的二次维护及其他依赖变化均拒绝，应走另行设计的验证迁移。
+
+宿主必须先备份、结束所有旧轨迹、停止其他写入者并关闭旧 runtime，确认外部环境没有在途行动。SDK 不能从历史轨迹表判断环境中的手牌是否结束；此项由宿主负责。使用新的模型构造专用维护 runtime，调用 `stop()` 排空后再维护。存储还会拒绝 active 研究、未决执行以及存活或跨主机执行所有者，不能用此方法接管另一进程。暂停激活配置保持原值；维护是显式操作者动作，不由自动研究或常规 `activate()` 触发。
+
+```js
+// oldRuntime 及其他写入者已关闭；app 使用同一应用/scope、当前领域和新的模型。
+const previousReleaseDigest = store.activeRelease(scopeId);
+const previous = store.release(previousReleaseDigest);
+const reportDigest = store.putArtifact('maintenance_check_report', verifiedReport, 'private');
+const evidenceDigest = store.putArtifact('model_maintenance_evidence', {
+  schemaVersion: '1.0', kind: 'bootstrap_model_maintenance', scopeId,
+  previousReleaseDigest, strategyDigest: previous.strategyDigest,
+  previousDependencies: previous.dependencies, newDependencies: app.dependencies,
+  reason: 'Verified transport retry correction', createdAt: Date.now(),
+  checks: [{ name: 'Transport regression and deployment checks', passed: true, artifactDigest: reportDigest }],
+}, 'private');
+await app.stop();
+const releaseDigest = await app.rebindBootstrapModel(scopeId, {
+  expectedReleaseDigest: previousReleaseDigest, evidenceDigest,
+});
+await app.close();
+// 重新打开正常 runtime；宿主显式恢复新轨迹。
+```
+
+`verifiedReport` 必须是宿主实际完成的验证结果；`passed: true` 是宿主对结果的明确声明。SDK 校验所有摘要、依赖变化范围、报告引用和证据结构，不替代宿主重新运行测试或判定修改是否保持策略语义。领域相关的允许变更（例如精确的旧/新重试政策）由宿主在调用前额外检查。
+
+事务比较当前 active 指针，保存不可变 `source: 'maintenance'` 发布，并追加 `release.model_maintenance` 私有事件；任何写入失败全部回滚。新发布记录 `previousReleaseDigest`、`evidenceDigest`，`validationDigest` 仍为空。正常资格检查会验证前一 bootstrap、相同策略、唯独模型行为变化、完整检查报告和已完成的维护提交。历史发布、轨迹 pin、验证报告及 holdout 不修改，旧轨迹仍指向旧发布并且不会取得新依赖下的运行资格。新轨迹和后续研究使用新的 active 发布。已有维护证据受到常规产物引用保护；备份、恢复和完整性检查保留相关引用。
+
+SQLite 仍为 Schema 3，决策 runtime 仍为 5；同一数据库的所有进程必须使用支持 maintenance 的版本。旧 SDK 会拒绝这类发布，回退应用版本需同时采用升级前备份，不能仅换回旧镜像并继续使用新 active 指针。
+
 ## 双循环调度和发布
 
 `ResearchWorker` 从已结算反馈和持久触发记录判断样本门槛与冷却时间。同一作用域已有未完成研究时不再创建另一轮。构造参数包括 `orchestrator`、`store`、`scopeId`、最终和开发协议、`settledTrajectories`、`cooldownMs`，以及可选 `onRelease` 回调。

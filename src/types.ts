@@ -89,7 +89,20 @@ export interface BehaviorDependencies {
 export interface ReleaseBinding {
   strategyDigest: string; dependencies: BehaviorDependencies; scopeId: string;
   expectedActiveDigest: string | null; validationDigest: string | null;
-  source: 'bootstrap' | 'research'; researchRunId?: string;
+  source: 'bootstrap' | 'research' | 'maintenance'; researchRunId?: string;
+  /** Present only on an explicitly authorized, unchanged-bootstrap model maintenance release. */
+  previousReleaseDigest?: string; evidenceDigest?: string;
+}
+export interface ModelMaintenanceEvidence {
+  schemaVersion: '1.0'; kind: 'bootstrap_model_maintenance'; scopeId: string;
+  previousReleaseDigest: string; strategyDigest: string;
+  previousDependencies: BehaviorDependencies; newDependencies: BehaviorDependencies;
+  reason: string; createdAt: number;
+  /** Host-produced verification reports; these are not research validation or profitability evidence. */
+  checks: Array<{ name: string; passed: true; artifactDigest: string }>;
+}
+export interface ModelMaintenanceOptions {
+  expectedReleaseDigest: string; evidenceDigest: string;
 }
 export interface DecisionOptions {
   signal?: AbortSignal;
@@ -201,6 +214,8 @@ export interface DuelLoopStore {
   events(options?: { scopeId?: string; afterId?: number; allowPrivate?: boolean; types?: string[]; limit?: number; descending?: boolean }): JournalEvent[];
   latestEvent(scopeId: string, type: string, options?: { allowPrivate?: boolean }): JournalEvent | undefined;
   registerRelease(binding: ReleaseBinding): string;
+  /** Optional operator-only capability. All other writers and live trajectories must be drained by the host. */
+  rebindBootstrapModel?(scopeId: string, dependencies: BehaviorDependencies, options: ModelMaintenanceOptions): string;
   activeRelease(scopeId: string): string | null;
   scopeSummary(scopeId: string): Pick<ScopeStatus, 'scopeId' | 'activeReleaseDigest' | 'activationMode' | 'activationPaused'>;
   scopeStatus(scopeId: string, dependencies?: BehaviorDependencies): ScopeStatus;

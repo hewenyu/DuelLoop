@@ -3,7 +3,7 @@ import { DuelLoopError, invariant } from './errors.js';
 import { buildQuestions, compileStrategy, evaluateAnswers, validateScoreAnswer } from './strategy.js';
 import { canonicalize, digest, seededRandom, withDeadline } from './utils.js';
 import { normalizeModelUsage } from './usage.js';
-import type { ActionCommand, BehaviorDependencies, CandidateAction, DecisionModel, DecisionOptions, DecisionRecord, DomainDefinition, DuelLoopStore, ExecutionMode, ExecutionReceipt, FeedbackEvent, JournalEvent, ModelUsage, Observation, StrategyPackage, TrajectoryIdentity } from './types.js';
+import type { ActionCommand, BehaviorDependencies, CandidateAction, DecisionModel, DecisionOptions, DecisionRecord, DomainDefinition, DuelLoopStore, ExecutionMode, ExecutionReceipt, FeedbackEvent, JournalEvent, ModelMaintenanceOptions, ModelUsage, Observation, StrategyPackage, TrajectoryIdentity } from './types.js';
 
 export interface DuelLoopOptions {
   applicationId: string; domain: DomainDefinition; model: DecisionModel; store: DuelLoopStore;
@@ -56,6 +56,25 @@ export class DuelLoop {
     const strategyDigest=this.store.putArtifact('strategy',compiled.strategy);
     const releaseDigest=this.store.registerRelease({strategyDigest,dependencies:this.dependencies,scopeId,expectedActiveDigest:null,validationDigest:null,source:'bootstrap'});
     this.store.activate(releaseDigest,this.dependencies,{explicit:true});this.emit('runtime.bootstrap',scopeId,{releaseDigest});return releaseDigest;
+  }
+  /** Operator-only model maintenance. The host must close other writers and finish all old trajectories first. */
+  async rebindBootstrapModel(scopeId:string,options:ModelMaintenanceOptions):Promise<string> {
+    this.ensureOpen();
+    invariant(this.stopping&&!this.closing&&this.pending.size===0&&this.busy.size===0,'CONFLICT','Maintenance requires a stopped, fully drained runtime');
+    invariant(this.store.rebindBootstrapModel,'CAPABILITY_UNSUPPORTED','Store does not support explicit model maintenance');
+    return this.track(async()=>{
+      this.ensureOpen();
+      this.store.bindScope(scopeId,this.applicationId);
+      const previous=this.store.release(options.expectedReleaseDigest);
+      compileStrategy(this.store.getArtifact<StrategyPackage>(previous.strategyDigest),this.domain);
+      if(this.domain.capabilities.activationBoundary==='scope') {
+        invariant(this.domain.canActivate,'CAPABILITY_UNSUPPORTED','Scope-wide boundary check required');
+        invariant(await this.domain.canActivate(scopeId),'ACTIVATION_DEFERRED','Maintenance requires an activation checkpoint',{reason:'scope_boundary'});
+      }
+      this.ensureOpen();
+      invariant(this.stopping&&!this.closing&&this.pending.size===1&&this.busy.size===0,'CONFLICT','Runtime changed while checking maintenance boundary');
+      return this.store.rebindBootstrapModel!(scopeId,this.dependencies,options);
+    });
   }
   activate(releaseDigest:string,explicit=false):Promise<void> {return this.track(()=>this.activateInternal(releaseDigest,explicit));}
   private async activateInternal(releaseDigest:string,explicit=false):Promise<void> {
